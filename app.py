@@ -7,7 +7,7 @@ from collections.abc import Callable
 
 import numpy as np
 from PIL import Image, ImageOps, UnidentifiedImageError
-from PySide6.QtCore import QObject, QRect, QThread, Qt, Signal, Slot
+from PySide6.QtCore import QObject, QRect, QSignalBlocker, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QCloseEvent, QColor, QImage, QPainter
 from PySide6.QtWidgets import (
     QApplication,
@@ -285,6 +285,77 @@ def apply_bayer_dithering(
     return result_image
 
 
+def apply_noise_dithering(
+    image: Image.Image,
+    color_count: int,
+    noise_intensity: int,
+    preserve_transparency: bool,
+    hard_alpha: bool,
+    seed: int = 12345,
+    cancel_callback: Callable[[], bool] | None = None,
+) -> Image.Image:
+    """Aplica ruído determinístico antes de mapear cores para a paleta."""
+    if cancel_callback is not None and cancel_callback():
+        raise ProcessingCancelled()
+
+    color_count = max(2, min(color_count, 256))
+    noise_intensity = max(0, min(100, int(noise_intensity)))
+    rgba_image = image.convert("RGBA")
+    source_pixels = np.asarray(rgba_image, dtype=np.uint8)
+    final_alpha = calculate_final_alpha(
+        source_pixels[:, :, 3], preserve_transparency, hard_alpha
+    )
+    if cancel_callback is not None and cancel_callback():
+        raise ProcessingCancelled()
+
+    _, palette_colors = create_adaptive_palette(
+        source_pixels, final_alpha, color_count
+    )
+    if cancel_callback is not None and cancel_callback():
+        raise ProcessingCancelled()
+    if palette_colors.size == 0:
+        return Image.new("RGBA", rgba_image.size, (0, 0, 0, 0))
+
+    color_lut = create_color_lut(palette_colors)
+    if cancel_callback is not None and cancel_callback():
+        raise ProcessingCancelled()
+
+    levels_per_channel = max(2.0, color_count ** (1.0 / 3.0))
+    base_amplitude = 255.0 / (levels_per_channel - 1.0)
+    amplitude = base_amplitude * (noise_intensity / 100.0)
+    rgb_pixels = source_pixels[:, :, :3].astype(np.float32)
+    if noise_intensity == 0:
+        # Zero significa quantização estável, sem gerar ruído desnecessário.
+        adjusted_rgb = rgb_pixels.copy()
+    else:
+        random_generator = np.random.default_rng(seed)
+        noise = random_generator.uniform(
+            -1.0, 1.0, size=rgb_pixels.shape
+        ).astype(np.float32)
+        adjusted_rgb = rgb_pixels + noise * amplitude
+    adjusted_rgb = np.nan_to_num(
+        adjusted_rgb, nan=0.0, posinf=255.0, neginf=0.0
+    )
+    adjusted_rgb = np.clip(adjusted_rgb, 0.0, 255.0)
+    if cancel_callback is not None and cancel_callback():
+        raise ProcessingCancelled()
+
+    lookup_indices = np.clip((adjusted_rgb * 31 / 255).astype(np.intp), 0, 31)
+    result_rgb = np.zeros_like(source_pixels[:, :, :3])
+    visible_mask = final_alpha > 0
+    result_rgb[visible_mask] = color_lut[
+        lookup_indices[:, :, 0][visible_mask],
+        lookup_indices[:, :, 1][visible_mask],
+        lookup_indices[:, :, 2][visible_mask],
+    ]
+    if cancel_callback is not None and cancel_callback():
+        raise ProcessingCancelled()
+
+    result_image = Image.fromarray(result_rgb, mode="RGB").convert("RGBA")
+    result_image.putalpha(Image.fromarray(final_alpha, mode="L"))
+    return result_image
+
+
 def create_atkinson_preview(image: Image.Image) -> Image.Image:
     """Cria uma cópia reduzida para a pré-visualização do Atkinson."""
     maximum_dimension = 1200
@@ -316,6 +387,8 @@ class ImageProcessingWorker(QObject):
         hard_alpha: bool,
         generation: int,
         method: str,
+        noise_intensity: int,
+        seed: int = 12345,
     ) -> None:
         super().__init__()
         self._image = image
@@ -324,6 +397,8 @@ class ImageProcessingWorker(QObject):
         self._hard_alpha = hard_alpha
         self._generation = generation
         self._method = method
+        self._noise_intensity = noise_intensity
+        self._seed = seed
         self._cancel_event = threading.Event()
 
     def request_cancel(self) -> None:
@@ -342,7 +417,7 @@ class ImageProcessingWorker(QObject):
                     self._hard_alpha,
                     self._cancel_event.is_set,
                 )
-            else:
+            elif self._method.startswith("Bayer "):
                 matrix_size = int(self._method.split()[1].split("x")[0])
                 result_image = apply_bayer_dithering(
                     self._image,
@@ -350,6 +425,16 @@ class ImageProcessingWorker(QObject):
                     matrix_size,
                     self._preserve_transparency,
                     self._hard_alpha,
+                    self._cancel_event.is_set,
+                )
+            else:
+                result_image = apply_noise_dithering(
+                    self._image,
+                    self._color_count,
+                    self._noise_intensity,
+                    self._preserve_transparency,
+                    self._hard_alpha,
+                    self._seed,
                     self._cancel_event.is_set,
                 )
         except ProcessingCancelled:
@@ -468,10 +553,13 @@ class MainWindow(QMainWindow):
         self.atkinson_thread: QThread | None = None
         self.atkinson_worker: ImageProcessingWorker | None = None
         self._pending_atkinson_request: tuple[
-            int, str, Image.Image, int, bool, bool
+            int, str, Image.Image, int, int, bool, bool
         ] | None = None
         self._atkinson_processing = False
         self._is_closing = False
+        self.noise_debounce_timer = QTimer(self)
+        self.noise_debounce_timer.setSingleShot(True)
+        self.noise_debounce_timer.setInterval(180)
 
         self.setWindowTitle("Dither App")
         self.resize(1200, 760)
@@ -559,6 +647,13 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.threshold_label)
         layout.addWidget(self.threshold_slider)
 
+        self.noise_label = QLabel("Intensidade do ruído: 50%")
+        self.noise_slider = QSlider(Qt.Orientation.Horizontal)
+        self.noise_slider.setRange(0, 100)
+        self.noise_slider.setValue(50)
+        layout.addWidget(self.noise_label)
+        layout.addWidget(self.noise_slider)
+
         self.preserve_alpha_checkbox = QCheckBox("Preservar transparência")
         self.preserve_alpha_checkbox.setChecked(True)
         self.hard_alpha_checkbox = QCheckBox("Alfa rígido para pixel art")
@@ -571,16 +666,20 @@ class MainWindow(QMainWindow):
         """Conecta os controles que atualizam o resultado."""
         self.method_combo.currentTextChanged.connect(self._on_method_changed)
         self.threshold_slider.valueChanged.connect(self._on_threshold_changed)
+        self.noise_slider.valueChanged.connect(self._on_noise_intensity_changed)
+        self.noise_debounce_timer.timeout.connect(self._apply_debounced_noise_update)
         self.colors_spinbox.valueChanged.connect(self._on_color_count_changed)
         self.preserve_alpha_checkbox.toggled.connect(self.update_result)
         self.hard_alpha_checkbox.toggled.connect(self.update_result)
 
     def _on_method_changed(self, method: str) -> None:
         """Atualiza o estado dos controles ao trocar de método."""
+        if method != "Ruído":
+            self.noise_debounce_timer.stop()
         self._update_control_states()
         if method not in (
             "Nenhum", "Threshold", "Floyd–Steinberg", "Atkinson",
-            "Bayer 2x2", "Bayer 4x4", "Bayer 8x8",
+            "Bayer 2x2", "Bayer 4x4", "Bayer 8x8", "Ruído",
         ):
             self.statusBar().showMessage(
                 f'"{method}" será implementado posteriormente.', 4000
@@ -594,11 +693,25 @@ class MainWindow(QMainWindow):
         self.threshold_label.setText(f"Limiar: {threshold}")
         self.update_result()
 
+    def _on_noise_intensity_changed(self, intensity: int) -> None:
+        """Mostra a porcentagem de ruído e atualiza o resultado quando necessário."""
+        self.noise_label.setText(f"Intensidade do ruído: {intensity}%")
+        if self.method_combo.currentText() == "Ruído":
+            # Invalida o resultado antigo sem criar uma thread a cada passo do slider.
+            self.processing_generation += 1
+            self._cancel_atkinson_processing()
+            self.noise_debounce_timer.start()
+
+    def _apply_debounced_noise_update(self) -> None:
+        """Processa Ruído quando o usuário para de mover o slider."""
+        if self.method_combo.currentText() == "Ruído":
+            self.update_result()
+
     def _on_color_count_changed(self, color_count: int) -> None:
         """Atualiza os métodos que usam quantidade de cores."""
         del color_count
         if self.method_combo.currentText() in (
-            "Floyd–Steinberg", "Atkinson", "Bayer 2x2", "Bayer 4x4", "Bayer 8x8",
+            "Floyd–Steinberg", "Atkinson", "Bayer 2x2", "Bayer 4x4", "Bayer 8x8", "Ruído",
         ):
             self.update_result()
 
@@ -606,17 +719,20 @@ class MainWindow(QMainWindow):
         """Ativa apenas os controles disponíveis para o método atual."""
         method = self.method_combo.currentText()
         is_threshold = method == "Threshold"
+        is_noise = method == "Ruído"
         uses_color_count = method in (
-            "Floyd–Steinberg", "Atkinson", "Bayer 2x2", "Bayer 4x4", "Bayer 8x8",
+            "Floyd–Steinberg", "Atkinson", "Bayer 2x2", "Bayer 4x4", "Bayer 8x8", "Ruído",
         )
         self.threshold_label.setEnabled(is_threshold)
         self.threshold_slider.setEnabled(is_threshold)
         self.colors_spinbox.setEnabled(uses_color_count)
+        self.noise_label.setEnabled(is_noise)
+        self.noise_slider.setEnabled(is_noise)
 
     @staticmethod
     def _is_background_method(method: str) -> bool:
         """Indica os métodos atendidos pelo worker compartilhado."""
-        return method in ("Atkinson", "Bayer 2x2", "Bayer 4x4", "Bayer 8x8")
+        return method in ("Atkinson", "Bayer 2x2", "Bayer 4x4", "Bayer 8x8", "Ruído")
 
     def import_image(self) -> None:
         """Abre uma imagem e a mostra nos dois painéis."""
@@ -683,7 +799,7 @@ class MainWindow(QMainWindow):
             finally:
                 QApplication.restoreOverrideCursor()
         elif self.method_combo.currentText() in (
-            "Atkinson", "Bayer 2x2", "Bayer 4x4", "Bayer 8x8",
+            "Atkinson", "Bayer 2x2", "Bayer 4x4", "Bayer 8x8", "Ruído",
         ):
             self._request_atkinson_processing(generation)
             return
@@ -703,6 +819,7 @@ class MainWindow(QMainWindow):
             self.method_combo.currentText(),
             create_atkinson_preview(self.original_image),
             self.colors_spinbox.value(),
+            self.noise_slider.value(),
             self.preserve_alpha_checkbox.isChecked(),
             self.hard_alpha_checkbox.isChecked(),
         )
@@ -715,11 +832,24 @@ class MainWindow(QMainWindow):
 
     def _start_atkinson_worker(
         self,
-        request: tuple[int, str, Image.Image, int, bool, bool],
+        request: tuple[int, str, Image.Image, int, int, bool, bool],
     ) -> None:
         """Cria um worker e mantém suas referências até o fim da thread."""
-        generation, method, preview_image, color_count, preserve_alpha, hard_alpha = request
-        self.statusBar().showMessage(f"Processando {method}...")
+        (
+            generation,
+            method,
+            preview_image,
+            color_count,
+            noise_intensity,
+            preserve_alpha,
+            hard_alpha,
+        ) = request
+        processing_message = (
+            "Processando dithering por ruído..."
+            if method == "Ruído"
+            else f"Processando {method}..."
+        )
+        self.statusBar().showMessage(processing_message)
         if not self._atkinson_processing:
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
             self._atkinson_processing = True
@@ -734,6 +864,7 @@ class MainWindow(QMainWindow):
             hard_alpha,
             generation,
             method,
+            noise_intensity,
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -771,8 +902,13 @@ class MainWindow(QMainWindow):
         self.result_image = result_image
         self.result_panel.preview.set_image(self.result_image)
         self.statusBar().showMessage(
-            f"{self.method_combo.currentText()} aplicado com "
-            f"{self.colors_spinbox.value()} cores"
+            (
+                f"Ruído aplicado com {self.colors_spinbox.value()} cores e "
+                f"intensidade de {self.noise_slider.value()}%"
+                if self.method_combo.currentText() == "Ruído"
+                else f"{self.method_combo.currentText()} aplicado com "
+                f"{self.colors_spinbox.value()} cores"
+            )
         )
 
     def _on_atkinson_failed(self, generation: int, error_details: str) -> None:
@@ -824,6 +960,7 @@ class MainWindow(QMainWindow):
         """Limpa as imagens e restaura os controles aos valores iniciais."""
         self.processing_generation += 1
         self._cancel_atkinson_processing()
+        self.noise_debounce_timer.stop()
         self.original_image = None
         self.result_image = None
         self.original_panel.preview.set_image(None)
@@ -831,16 +968,29 @@ class MainWindow(QMainWindow):
         self.reset_button.setEnabled(False)
         self.export_button.setEnabled(False)
 
+        controls = (
+            self.method_combo,
+            self.threshold_slider,
+            self.noise_slider,
+            self.colors_spinbox,
+            self.preserve_alpha_checkbox,
+            self.hard_alpha_checkbox,
+        )
+        blockers = [QSignalBlocker(control) for control in controls]
         self.method_combo.setCurrentText("Nenhum")
         self.threshold_slider.setValue(128)
+        self.noise_slider.setValue(50)
+        self.noise_label.setText("Intensidade do ruído: 50%")
         self.colors_spinbox.setValue(16)
         self.preserve_alpha_checkbox.setChecked(True)
         self.hard_alpha_checkbox.setChecked(False)
+        del blockers
         self._update_control_states()
 
     def closeEvent(self, event: QCloseEvent) -> None:
         """Cancela o worker antes de destruir a janela."""
         self._is_closing = True
+        self.noise_debounce_timer.stop()
         self._cancel_atkinson_processing()
         if self.atkinson_thread is not None and self.atkinson_thread.isRunning():
             self.atkinson_thread.wait()
