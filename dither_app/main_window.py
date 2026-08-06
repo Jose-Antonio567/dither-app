@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageOps, UnidentifiedImageError
 from PySide6.QtCore import QObject, QRect, QSignalBlocker, QThread, QTimer, Qt, Signal, Slot
-from PySide6.QtGui import QAction, QCloseEvent, QColor, QImage, QKeySequence, QMouseEvent, QPainter
+from PySide6.QtGui import QAction, QCloseEvent, QColor, QIcon, QImage, QKeySequence, QMouseEvent, QPainter
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from dither_app.resources import app_icon_path
 
 
 @dataclass(frozen=True)
@@ -711,6 +712,9 @@ class MainWindow(QMainWindow):
         self.background_debounce_timer.setInterval(150)
 
         self.setWindowTitle("Dither App")
+        icon_path = app_icon_path()
+        if icon_path.is_file():
+            self.setWindowIcon(QIcon(str(icon_path)))
         self.resize(1200, 760)
         self.setMinimumSize(900, 600)
         self.setAcceptDrops(True)
