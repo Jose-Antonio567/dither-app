@@ -1,16 +1,20 @@
-"""Interface inicial do Dither App."""
+"""Interface inicial do Dither App com importação e pré-visualização."""
 
 import sys
 
-from PySide6.QtCore import Qt
+from PIL import Image, ImageOps, UnidentifiedImageError
+from PySide6.QtCore import QRect, Qt
+from PySide6.QtGui import QColor, QImage, QPainter
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QSizePolicy,
     QSpinBox,
@@ -19,8 +23,85 @@ from PySide6.QtWidgets import (
 )
 
 
+class ImagePreviewWidget(QWidget):
+    """Mostra uma imagem sobre um fundo quadriculado de transparência."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._image: QImage | None = None
+        self.setMinimumSize(200, 180)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def set_image(self, image: Image.Image | None) -> None:
+        """Recebe uma imagem Pillow RGBA e atualiza a pré-visualização."""
+        self._image = self._pillow_to_qimage(image) if image is not None else None
+        self.update()
+
+    @staticmethod
+    def _pillow_to_qimage(image: Image.Image) -> QImage:
+        """Converte RGBA do Pillow para QImage sem perder o canal alfa."""
+        rgba_data = image.tobytes("raw", "RGBA")
+        qimage = QImage(
+            rgba_data,
+            image.width,
+            image.height,
+            image.width * 4,
+            QImage.Format.Format_RGBA8888,
+        )
+        # copy() torna o QImage independente do buffer temporário em Python.
+        return qimage.copy()
+
+    def paintEvent(self, event: object) -> None:
+        """Desenha o quadriculado, a imagem centralizada ou o aviso vazio."""
+        del event
+        painter = QPainter(self)
+        try:
+            if self.size().isEmpty():
+                return
+
+            self._draw_checkerboard(painter)
+
+            if self._image is None:
+                painter.setPen(QColor("#9da1a6"))
+                painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Nenhuma imagem carregada")
+                return
+
+            image_size = self._image.size()
+            preview_size = image_size.scaled(
+                self.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+            )
+            if preview_size.isEmpty():
+                return
+
+            target_rect = QRect(0, 0, preview_size.width(), preview_size.height())
+            target_rect.moveCenter(self.rect().center())
+
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            painter.drawImage(target_rect, self._image)
+        finally:
+            painter.end()
+
+    def _draw_checkerboard(self, painter: QPainter) -> None:
+        """Desenha quadrados alternados para indicar áreas transparentes."""
+        square_size = 16
+        light_color = QColor("#c8c8c8")
+        dark_color = QColor("#9d9d9d")
+
+        for y_position in range(0, self.height(), square_size):
+            for x_position in range(0, self.width(), square_size):
+                is_light_square = (x_position // square_size + y_position // square_size) % 2 == 0
+                painter.fillRect(
+                    x_position,
+                    y_position,
+                    square_size,
+                    square_size,
+                    light_color if is_light_square else dark_color,
+                )
+
+
 class ImagePanel(QFrame):
-    """Área reservada para exibir uma imagem."""
+    """Área com título que contém uma pré-visualização de imagem."""
 
     def __init__(self, title: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -35,11 +116,8 @@ class ImagePanel(QFrame):
         title_label.setObjectName("panelTitle")
         layout.addWidget(title_label)
 
-        # Espaço central onde a imagem será mostrada em etapas futuras.
-        placeholder = QLabel("Nenhuma imagem carregada")
-        placeholder.setObjectName("placeholder")
-        placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(placeholder, 1)
+        self.preview = ImagePreviewWidget()
+        layout.addWidget(self.preview, 1)
 
 
 class MainWindow(QMainWindow):
@@ -47,6 +125,9 @@ class MainWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
+        self.original_image: Image.Image | None = None
+        self.result_image: Image.Image | None = None
+
         self.setWindowTitle("Dither App")
         self.resize(1200, 760)
         self.setMinimumSize(900, 600)
@@ -66,15 +147,17 @@ class MainWindow(QMainWindow):
         toolbar_layout = QHBoxLayout()
         toolbar_layout.setSpacing(10)
 
-        import_button = QPushButton("Importar imagem")
-        export_button = QPushButton("Exportar PNG")
-        reset_button = QPushButton("Redefinir")
-        export_button.setEnabled(False)
-        reset_button.setEnabled(False)
+        self.import_button = QPushButton("Importar imagem")
+        self.export_button = QPushButton("Exportar PNG")
+        self.reset_button = QPushButton("Redefinir")
+        self.export_button.setEnabled(False)
+        self.reset_button.setEnabled(False)
+        self.import_button.clicked.connect(self.import_image)
+        self.reset_button.clicked.connect(self.reset_application)
 
-        toolbar_layout.addWidget(import_button)
-        toolbar_layout.addWidget(export_button)
-        toolbar_layout.addWidget(reset_button)
+        toolbar_layout.addWidget(self.import_button)
+        toolbar_layout.addWidget(self.export_button)
+        toolbar_layout.addWidget(self.reset_button)
         toolbar_layout.addStretch()
         main_layout.addLayout(toolbar_layout)
 
@@ -83,12 +166,13 @@ class MainWindow(QMainWindow):
 
         images_layout = QHBoxLayout()
         images_layout.setSpacing(16)
-        images_layout.addWidget(ImagePanel("Imagem original"), 1)
-        images_layout.addWidget(ImagePanel("Resultado"), 1)
+        self.original_panel = ImagePanel("Imagem original")
+        self.result_panel = ImagePanel("Resultado")
+        images_layout.addWidget(self.original_panel, 1)
+        images_layout.addWidget(self.result_panel, 1)
         content_layout.addLayout(images_layout, 1)
 
-        settings_panel = self._create_settings_panel()
-        content_layout.addWidget(settings_panel)
+        content_layout.addWidget(self._create_settings_panel())
         main_layout.addLayout(content_layout, 1)
 
     def _create_settings_panel(self) -> QFrame:
@@ -105,38 +189,72 @@ class MainWindow(QMainWindow):
         title_label.setObjectName("settingsTitle")
         layout.addWidget(title_label)
 
-        method_label = QLabel("Método de dithering")
-        method_combo = QComboBox()
-        method_combo.addItems(
+        layout.addWidget(QLabel("Método de dithering"))
+        self.method_combo = QComboBox()
+        self.method_combo.addItems(
             [
-                "Nenhum",
-                "Threshold",
-                "Floyd–Steinberg",
-                "Atkinson",
-                "Bayer 2x2",
-                "Bayer 4x4",
-                "Bayer 8x8",
-                "Ruído",
+                "Nenhum", "Threshold", "Floyd–Steinberg", "Atkinson",
+                "Bayer 2x2", "Bayer 4x4", "Bayer 8x8", "Ruído",
             ]
         )
-        layout.addWidget(method_label)
-        layout.addWidget(method_combo)
+        layout.addWidget(self.method_combo)
 
-        colors_label = QLabel("Quantidade de cores")
-        colors_spinbox = QSpinBox()
-        colors_spinbox.setRange(2, 256)
-        colors_spinbox.setValue(16)
-        layout.addWidget(colors_label)
-        layout.addWidget(colors_spinbox)
+        layout.addWidget(QLabel("Quantidade de cores"))
+        self.colors_spinbox = QSpinBox()
+        self.colors_spinbox.setRange(2, 256)
+        self.colors_spinbox.setValue(16)
+        layout.addWidget(self.colors_spinbox)
 
-        preserve_alpha_checkbox = QCheckBox("Preservar transparência")
-        preserve_alpha_checkbox.setChecked(True)
-        hard_alpha_checkbox = QCheckBox("Alfa rígido para pixel art")
-        layout.addWidget(preserve_alpha_checkbox)
-        layout.addWidget(hard_alpha_checkbox)
+        self.preserve_alpha_checkbox = QCheckBox("Preservar transparência")
+        self.preserve_alpha_checkbox.setChecked(True)
+        self.hard_alpha_checkbox = QCheckBox("Alfa rígido para pixel art")
+        layout.addWidget(self.preserve_alpha_checkbox)
+        layout.addWidget(self.hard_alpha_checkbox)
         layout.addStretch()
-
         return panel
+
+    def import_image(self) -> None:
+        """Abre uma imagem e a mostra nos dois painéis."""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Selecionar imagem",
+            "",
+            "Imagens (*.png *.jpg *.jpeg *.webp *.bmp)",
+        )
+        if not file_path:
+            return
+
+        try:
+            with Image.open(file_path) as opened_image:
+                corrected_image = ImageOps.exif_transpose(opened_image)
+                self.original_image = corrected_image.convert("RGBA")
+            self.result_image = self.original_image.copy()
+        except (OSError, UnidentifiedImageError) as error:
+            QMessageBox.critical(
+                self,
+                "Não foi possível abrir a imagem",
+                f"O arquivo não pôde ser aberto:\n{file_path}\n\nDetalhes: {error}",
+            )
+            return
+
+        self.original_panel.preview.set_image(self.original_image)
+        self.result_panel.preview.set_image(self.result_image)
+        self.reset_button.setEnabled(True)
+        self.export_button.setEnabled(False)
+
+    def reset_application(self) -> None:
+        """Limpa as imagens e restaura os controles aos valores iniciais."""
+        self.original_image = None
+        self.result_image = None
+        self.original_panel.preview.set_image(None)
+        self.result_panel.preview.set_image(None)
+        self.reset_button.setEnabled(False)
+        self.export_button.setEnabled(False)
+
+        self.method_combo.setCurrentText("Nenhum")
+        self.colors_spinbox.setValue(16)
+        self.preserve_alpha_checkbox.setChecked(True)
+        self.hard_alpha_checkbox.setChecked(False)
 
     def _apply_styles(self) -> None:
         """Aplica uma aparência escura simples à aplicação."""
@@ -167,7 +285,6 @@ class MainWindow(QMainWindow):
                 font-size: 16px;
                 font-weight: 600;
             }
-            #placeholder { color: #9da1a6; font-size: 15px; }
             QComboBox, QSpinBox {
                 background-color: #202124;
                 border: 1px solid #50535a;
