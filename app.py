@@ -2,6 +2,7 @@
 
 import sys
 
+import numpy as np
 from PIL import Image, ImageOps, UnidentifiedImageError
 from PySide6.QtCore import QRect, Qt
 from PySide6.QtGui import QColor, QImage, QPainter
@@ -17,10 +18,45 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSizePolicy,
+    QSlider,
     QSpinBox,
     QVBoxLayout,
     QWidget,
 )
+
+
+def apply_threshold(
+    image: Image.Image,
+    threshold: int,
+    preserve_transparency: bool,
+    hard_alpha: bool,
+) -> Image.Image:
+    """Cria uma imagem preta e branca a partir de uma imagem RGBA."""
+    source_pixels = np.asarray(image.convert("RGBA"), dtype=np.uint8)
+    result_pixels = np.empty_like(source_pixels)
+
+    # Calcula luminância sem percorrer os pixels manualmente.
+    rgb_pixels = source_pixels[:, :, :3].astype(np.float32)
+    luminance = (
+        0.2126 * rgb_pixels[:, :, 0]
+        + 0.7152 * rgb_pixels[:, :, 1]
+        + 0.0722 * rgb_pixels[:, :, 2]
+    )
+    black_or_white = np.where(luminance >= threshold, 255, 0).astype(np.uint8)
+    result_pixels[:, :, :3] = black_or_white[:, :, np.newaxis]
+
+    if preserve_transparency:
+        result_pixels[:, :, 3] = source_pixels[:, :, 3]
+        if hard_alpha:
+            result_pixels[:, :, 3] = np.where(
+                result_pixels[:, :, 3] >= 128, 255, 0
+            ).astype(np.uint8)
+    else:
+        result_pixels[:, :, 3] = 255
+
+    # Evita cores invisíveis em pixels totalmente transparentes.
+    result_pixels[result_pixels[:, :, 3] == 0, :3] = 0
+    return Image.fromarray(result_pixels, mode="RGBA")
 
 
 class ImagePreviewWidget(QWidget):
@@ -134,6 +170,8 @@ class MainWindow(QMainWindow):
 
         self._create_interface()
         self._apply_styles()
+        self._connect_controls()
+        self._update_control_states()
 
     def _create_interface(self) -> None:
         """Monta os painéis e controles da janela."""
@@ -205,6 +243,13 @@ class MainWindow(QMainWindow):
         self.colors_spinbox.setValue(16)
         layout.addWidget(self.colors_spinbox)
 
+        self.threshold_label = QLabel("Limiar: 128")
+        self.threshold_slider = QSlider(Qt.Orientation.Horizontal)
+        self.threshold_slider.setRange(0, 255)
+        self.threshold_slider.setValue(128)
+        layout.addWidget(self.threshold_label)
+        layout.addWidget(self.threshold_slider)
+
         self.preserve_alpha_checkbox = QCheckBox("Preservar transparência")
         self.preserve_alpha_checkbox.setChecked(True)
         self.hard_alpha_checkbox = QCheckBox("Alfa rígido para pixel art")
@@ -212,6 +257,36 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.hard_alpha_checkbox)
         layout.addStretch()
         return panel
+
+    def _connect_controls(self) -> None:
+        """Conecta os controles que atualizam o resultado."""
+        self.method_combo.currentTextChanged.connect(self._on_method_changed)
+        self.threshold_slider.valueChanged.connect(self._on_threshold_changed)
+        self.preserve_alpha_checkbox.toggled.connect(self.update_result)
+        self.hard_alpha_checkbox.toggled.connect(self.update_result)
+
+    def _on_method_changed(self, method: str) -> None:
+        """Atualiza o estado dos controles ao trocar de método."""
+        self._update_control_states()
+        if method not in ("Nenhum", "Threshold"):
+            self.statusBar().showMessage(
+                f'"{method}" será implementado posteriormente.', 4000
+            )
+        else:
+            self.statusBar().clearMessage()
+        self.update_result()
+
+    def _on_threshold_changed(self, threshold: int) -> None:
+        """Mostra o valor atual do limiar e recalcula o resultado."""
+        self.threshold_label.setText(f"Limiar: {threshold}")
+        self.update_result()
+
+    def _update_control_states(self) -> None:
+        """Ativa apenas os controles disponíveis para o método atual."""
+        is_threshold = self.method_combo.currentText() == "Threshold"
+        self.threshold_label.setEnabled(is_threshold)
+        self.threshold_slider.setEnabled(is_threshold)
+        self.colors_spinbox.setEnabled(False)
 
     def import_image(self) -> None:
         """Abre uma imagem e a mostra nos dois painéis."""
@@ -228,7 +303,6 @@ class MainWindow(QMainWindow):
             with Image.open(file_path) as opened_image:
                 corrected_image = ImageOps.exif_transpose(opened_image)
                 self.original_image = corrected_image.convert("RGBA")
-            self.result_image = self.original_image.copy()
         except (OSError, UnidentifiedImageError) as error:
             QMessageBox.critical(
                 self,
@@ -238,9 +312,26 @@ class MainWindow(QMainWindow):
             return
 
         self.original_panel.preview.set_image(self.original_image)
-        self.result_panel.preview.set_image(self.result_image)
+        self.update_result()
         self.reset_button.setEnabled(True)
         self.export_button.setEnabled(False)
+
+    def update_result(self) -> None:
+        """Recalcula o resultado sempre a partir da imagem original."""
+        if self.original_image is None:
+            return
+
+        if self.method_combo.currentText() == "Threshold":
+            self.result_image = apply_threshold(
+                self.original_image,
+                self.threshold_slider.value(),
+                self.preserve_alpha_checkbox.isChecked(),
+                self.hard_alpha_checkbox.isChecked(),
+            )
+        else:
+            self.result_image = self.original_image.copy()
+
+        self.result_panel.preview.set_image(self.result_image)
 
     def reset_application(self) -> None:
         """Limpa as imagens e restaura os controles aos valores iniciais."""
@@ -252,9 +343,11 @@ class MainWindow(QMainWindow):
         self.export_button.setEnabled(False)
 
         self.method_combo.setCurrentText("Nenhum")
+        self.threshold_slider.setValue(128)
         self.colors_spinbox.setValue(16)
         self.preserve_alpha_checkbox.setChecked(True)
         self.hard_alpha_checkbox.setChecked(False)
+        self._update_control_states()
 
     def _apply_styles(self) -> None:
         """Aplica uma aparência escura simples à aplicação."""
