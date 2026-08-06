@@ -4,6 +4,7 @@ import sys
 import threading
 import traceback
 from collections.abc import Callable
+from collections import deque
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -11,7 +12,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageOps, UnidentifiedImageError
 from PySide6.QtCore import QObject, QRect, QSignalBlocker, QThread, QTimer, Qt, Signal, Slot
-from PySide6.QtGui import QCloseEvent, QColor, QImage, QPainter
+from PySide6.QtGui import QCloseEvent, QColor, QImage, QMouseEvent, QPainter
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -42,6 +43,47 @@ class ProcessingSettings:
     preserve_transparency: bool
     hard_alpha: bool
     noise_seed: int = 12345
+    remove_background: bool = False
+    background_color: tuple[int, int, int] = (255, 255, 255)
+    background_tolerance: int = 30
+    background_connected_only: bool = True
+
+
+def remove_background_by_color(
+    image: Image.Image, target_color: tuple[int, int, int], tolerance: int,
+    connected_only: bool, cancel_callback: Callable[[], bool] | None = None,
+) -> Image.Image:
+    """Remove pixels semelhantes a uma cor, globalmente ou pelas bordas."""
+    pixels = np.asarray(image.convert("RGBA"), dtype=np.uint8).copy()
+    tolerance = max(0, min(255, int(tolerance)))
+    difference = pixels[:, :, :3].astype(np.int32) - np.array(target_color, dtype=np.int32)
+    matching = np.sum(difference * difference, axis=2) <= 3 * tolerance * tolerance
+    matching &= pixels[:, :, 3] > 0
+    if connected_only:
+        height, width = matching.shape
+        removable = np.zeros_like(matching)
+        queue: deque[tuple[int, int]] = deque()
+        for x_position in range(width):
+            for y_position in (0, height - 1):
+                if matching[y_position, x_position] and not removable[y_position, x_position]:
+                    removable[y_position, x_position] = True; queue.append((x_position, y_position))
+        for y_position in range(height):
+            for x_position in (0, width - 1):
+                if matching[y_position, x_position] and not removable[y_position, x_position]:
+                    removable[y_position, x_position] = True; queue.append((x_position, y_position))
+        processed = 0
+        while queue:
+            x_position, y_position = queue.popleft(); processed += 1
+            if cancel_callback is not None and processed % 4096 == 0 and cancel_callback():
+                raise ProcessingCancelled()
+            for neighbor_x, neighbor_y in ((x_position-1,y_position),(x_position+1,y_position),(x_position,y_position-1),(x_position,y_position+1)):
+                if 0 <= neighbor_x < width and 0 <= neighbor_y < height and matching[neighbor_y, neighbor_x] and not removable[neighbor_y, neighbor_x]:
+                    removable[neighbor_y, neighbor_x] = True; queue.append((neighbor_x, neighbor_y))
+    else:
+        removable = matching
+    pixels[removable, 3] = 0
+    pixels[pixels[:, :, 3] == 0, :3] = 0
+    return Image.fromarray(pixels, mode="RGBA")
 
 
 def apply_alpha_settings(
@@ -65,32 +107,38 @@ def process_image_with_settings(
 ) -> Image.Image:
     """Processa uma imagem usando um conjunto fechado de configurações."""
     method = settings.method
+    working_image = image
+    if settings.remove_background:
+        working_image = remove_background_by_color(
+            image, settings.background_color, settings.background_tolerance,
+            settings.background_connected_only, cancel_callback
+        )
     if method == "Nenhum":
         return apply_alpha_settings(
-            image, settings.preserve_transparency, settings.hard_alpha
+            working_image, settings.preserve_transparency, settings.hard_alpha
         )
     if method == "Threshold":
         return apply_threshold(
-            image, settings.threshold, settings.preserve_transparency, settings.hard_alpha
+            working_image, settings.threshold, settings.preserve_transparency, settings.hard_alpha
         )
     if method == "Floyd–Steinberg":
         return apply_floyd_steinberg(
-            image, settings.color_count, settings.preserve_transparency, settings.hard_alpha
+            working_image, settings.color_count, settings.preserve_transparency, settings.hard_alpha
         )
     if method == "Atkinson":
         return apply_atkinson(
-            image, settings.color_count, settings.preserve_transparency,
+            working_image, settings.color_count, settings.preserve_transparency,
             settings.hard_alpha, cancel_callback
         )
     if method.startswith("Bayer "):
         matrix_size = int(method.split()[1].split("x")[0])
         return apply_bayer_dithering(
-            image, settings.color_count, matrix_size, settings.preserve_transparency,
+            working_image, settings.color_count, matrix_size, settings.preserve_transparency,
             settings.hard_alpha, cancel_callback
         )
     if method == "Ruído":
         return apply_noise_dithering(
-            image, settings.color_count, settings.noise_intensity,
+            working_image, settings.color_count, settings.noise_intensity,
             settings.preserve_transparency, settings.hard_alpha, settings.noise_seed,
             cancel_callback
         )
@@ -514,9 +562,12 @@ class ImageProcessingWorker(QObject):
 class ImagePreviewWidget(QWidget):
     """Mostra uma imagem sobre um fundo quadriculado de transparência."""
 
+    imagePixelClicked = Signal(int, int)
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._image: QImage | None = None
+        self._image_rect = QRect()
         self.setMinimumSize(200, 180)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
@@ -550,6 +601,7 @@ class ImagePreviewWidget(QWidget):
             self._draw_checkerboard(painter)
 
             if self._image is None:
+                self._image_rect = QRect()
                 painter.setPen(QColor("#9da1a6"))
                 painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Nenhuma imagem carregada")
                 return
@@ -564,11 +616,30 @@ class ImagePreviewWidget(QWidget):
 
             target_rect = QRect(0, 0, preview_size.width(), preview_size.height())
             target_rect.moveCenter(self.rect().center())
+            self._image_rect = QRect(target_rect)
 
             painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
             painter.drawImage(target_rect, self._image)
         finally:
             painter.end()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        """Converte um clique válido da prévia em coordenadas da imagem."""
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self._image is not None
+            and not self._image_rect.isEmpty()
+            and self._image_rect.contains(event.position().toPoint())
+        ):
+            position = event.position()
+            local_x = position.x() - self._image_rect.left()
+            local_y = position.y() - self._image_rect.top()
+            image_x = int(local_x / self._image_rect.width() * self._image.width())
+            image_y = int(local_y / self._image_rect.height() * self._image.height())
+            image_x = max(0, min(self._image.width() - 1, image_x))
+            image_y = max(0, min(self._image.height() - 1, image_y))
+            self.imagePixelClicked.emit(image_x, image_y)
+        super().mousePressEvent(event)
 
     def _draw_checkerboard(self, painter: QPainter) -> None:
         """Desenha quadrados alternados para indicar áreas transparentes."""
@@ -616,6 +687,8 @@ class MainWindow(QMainWindow):
         self.original_image: Image.Image | None = None
         self.result_image: Image.Image | None = None
         self.original_file_path: str | None = None
+        self.eyedropper_active = False
+        self.background_color = (255, 255, 255)
         self.processing_generation = 0
         self.atkinson_thread: QThread | None = None
         self.atkinson_worker: ImageProcessingWorker | None = None
@@ -632,6 +705,9 @@ class MainWindow(QMainWindow):
         self.noise_debounce_timer = QTimer(self)
         self.noise_debounce_timer.setSingleShot(True)
         self.noise_debounce_timer.setInterval(180)
+        self.background_debounce_timer = QTimer(self)
+        self.background_debounce_timer.setSingleShot(True)
+        self.background_debounce_timer.setInterval(150)
 
         self.setWindowTitle("Dither App")
         self.resize(1200, 760)
@@ -675,6 +751,7 @@ class MainWindow(QMainWindow):
         images_layout = QHBoxLayout()
         images_layout.setSpacing(16)
         self.original_panel = ImagePanel("Imagem original")
+        self.original_panel.preview.imagePixelClicked.connect(self._pick_background_color)
         self.result_panel = ImagePanel("Resultado")
         images_layout.addWidget(self.original_panel, 1)
         images_layout.addWidget(self.result_panel, 1)
@@ -732,6 +809,14 @@ class MainWindow(QMainWindow):
         self.hard_alpha_checkbox = QCheckBox("Alfa rígido para pixel art")
         layout.addWidget(self.preserve_alpha_checkbox)
         layout.addWidget(self.hard_alpha_checkbox)
+        layout.addWidget(QLabel("Remoção de fundo"))
+        self.remove_background_checkbox = QCheckBox("Remover fundo por cor")
+        self.background_color_button = QPushButton("Selecionar cor na imagem")
+        self.background_swatch = QLabel(); self.background_swatch.setFixedSize(28, 28)
+        self.background_tolerance_label = QLabel("Tolerância: 30")
+        self.background_tolerance_slider = QSlider(Qt.Orientation.Horizontal); self.background_tolerance_slider.setRange(0, 255); self.background_tolerance_slider.setValue(30)
+        self.background_connected_checkbox = QCheckBox("Somente fundo conectado às bordas"); self.background_connected_checkbox.setChecked(True)
+        for control in (self.remove_background_checkbox, self.background_color_button, self.background_swatch, self.background_tolerance_label, self.background_tolerance_slider, self.background_connected_checkbox): layout.addWidget(control)
         layout.addStretch()
         return panel
 
@@ -744,6 +829,12 @@ class MainWindow(QMainWindow):
         self.colors_spinbox.valueChanged.connect(self._on_color_count_changed)
         self.preserve_alpha_checkbox.toggled.connect(self.update_result)
         self.hard_alpha_checkbox.toggled.connect(self.update_result)
+        self.remove_background_checkbox.toggled.connect(self._on_background_changed)
+        self.background_color_button.clicked.connect(self._toggle_eyedropper)
+        self.background_tolerance_slider.valueChanged.connect(self._on_background_tolerance_changed)
+        self.background_connected_checkbox.toggled.connect(self._on_background_changed)
+        self.background_debounce_timer.timeout.connect(self.update_result)
+        self._update_background_swatch(); self._update_background_controls()
 
     def _on_method_changed(self, method: str) -> None:
         """Atualiza o estado dos controles ao trocar de método."""
@@ -774,6 +865,32 @@ class MainWindow(QMainWindow):
             self.processing_generation += 1
             self._cancel_atkinson_processing()
             self.noise_debounce_timer.start()
+
+    def _on_background_changed(self) -> None:
+        self._update_background_controls()
+        self.update_result()
+
+    def _on_background_tolerance_changed(self, value: int) -> None:
+        self.background_tolerance_label.setText(f"Tolerância: {value}")
+        if self.remove_background_checkbox.isChecked(): self.background_debounce_timer.start()
+
+    def _update_background_controls(self) -> None:
+        enabled = self.remove_background_checkbox.isChecked()
+        for control in (self.background_color_button, self.background_tolerance_label, self.background_tolerance_slider, self.background_connected_checkbox): control.setEnabled(enabled)
+
+    def _update_background_swatch(self) -> None:
+        red, green, blue = self.background_color
+        self.background_swatch.setStyleSheet(f"background-color: rgb({red}, {green}, {blue}); border: 1px solid #777;")
+
+    def _toggle_eyedropper(self) -> None:
+        self.eyedropper_active = not self.eyedropper_active
+        self.original_panel.preview.setCursor(Qt.CursorShape.CrossCursor if self.eyedropper_active else Qt.CursorShape.ArrowCursor)
+        self.statusBar().showMessage("Clique em uma cor da imagem original" if self.eyedropper_active else "")
+
+    def _pick_background_color(self, x_position: int, y_position: int) -> None:
+        if not self.eyedropper_active or self.original_image is None: return
+        self.background_color = tuple(self.original_image.getpixel((x_position, y_position))[:3])
+        self.eyedropper_active = False; self.original_panel.preview.unsetCursor(); self._update_background_swatch(); self.update_result()
 
     def _apply_debounced_noise_update(self) -> None:
         """Processa Ruído quando o usuário para de mover o slider."""
@@ -841,6 +958,12 @@ class MainWindow(QMainWindow):
         self.processing_generation += 1
         generation = self.processing_generation
         if self.original_image is None:
+            return
+
+        if self.remove_background_checkbox.isChecked() and self.method_combo.currentText() in ("Nenhum", "Threshold", "Floyd–Steinberg"):
+            self._cancel_atkinson_processing()
+            self.result_image = process_image_with_settings(self.original_image, self._current_settings())
+            self.result_panel.preview.set_image(self.result_image)
             return
 
         if self.method_combo.currentText() == "Threshold":
@@ -930,14 +1053,7 @@ class MainWindow(QMainWindow):
         QApplication.processEvents()
         self._set_atkinson_processing_state(True)
 
-        settings = ProcessingSettings(
-            method=method,
-            color_count=color_count,
-            threshold=self.threshold_slider.value(),
-            noise_intensity=noise_intensity,
-            preserve_transparency=preserve_alpha,
-            hard_alpha=hard_alpha,
-        )
+        settings = self._current_settings()
 
         thread = QThread(self)
         worker = ImageProcessingWorker(
@@ -980,6 +1096,10 @@ class MainWindow(QMainWindow):
             noise_intensity=self.noise_slider.value(),
             preserve_transparency=self.preserve_alpha_checkbox.isChecked(),
             hard_alpha=self.hard_alpha_checkbox.isChecked(),
+            remove_background=self.remove_background_checkbox.isChecked(),
+            background_color=self.background_color,
+            background_tolerance=self.background_tolerance_slider.value(),
+            background_connected_only=self.background_connected_checkbox.isChecked(),
         )
 
     def export_png(self) -> None:
@@ -1179,6 +1299,9 @@ class MainWindow(QMainWindow):
         self.processing_generation += 1
         self._cancel_atkinson_processing()
         self.noise_debounce_timer.stop()
+        self.background_debounce_timer.stop()
+        self.eyedropper_active = False
+        self.original_panel.preview.unsetCursor()
         self.original_image = None
         self.result_image = None
         self.original_file_path = None
@@ -1203,6 +1326,13 @@ class MainWindow(QMainWindow):
         self.colors_spinbox.setValue(16)
         self.preserve_alpha_checkbox.setChecked(True)
         self.hard_alpha_checkbox.setChecked(False)
+        self.remove_background_checkbox.setChecked(False)
+        self.background_color = (255, 255, 255)
+        self.background_tolerance_slider.setValue(30)
+        self.background_tolerance_label.setText("Tolerância: 30")
+        self.background_connected_checkbox.setChecked(True)
+        self._update_background_swatch()
+        self._update_background_controls()
         del blockers
         self._update_control_states()
 
