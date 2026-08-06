@@ -45,18 +45,71 @@ def apply_threshold(
     black_or_white = np.where(luminance >= threshold, 255, 0).astype(np.uint8)
     result_pixels[:, :, :3] = black_or_white[:, :, np.newaxis]
 
-    if preserve_transparency:
-        result_pixels[:, :, 3] = source_pixels[:, :, 3]
-        if hard_alpha:
-            result_pixels[:, :, 3] = np.where(
-                result_pixels[:, :, 3] >= 128, 255, 0
-            ).astype(np.uint8)
-    else:
-        result_pixels[:, :, 3] = 255
+    result_pixels[:, :, 3] = calculate_final_alpha(
+        source_pixels[:, :, 3], preserve_transparency, hard_alpha
+    )
 
     # Evita cores invisíveis em pixels totalmente transparentes.
     result_pixels[result_pixels[:, :, 3] == 0, :3] = 0
     return Image.fromarray(result_pixels, mode="RGBA")
+
+
+def calculate_final_alpha(
+    original_alpha: np.ndarray,
+    preserve_transparency: bool,
+    hard_alpha: bool,
+) -> np.ndarray:
+    """Calcula o canal alfa final conforme as opções escolhidas."""
+    if not preserve_transparency:
+        return np.full_like(original_alpha, 255)
+
+    final_alpha = original_alpha.copy()
+    if hard_alpha:
+        final_alpha = np.where(final_alpha >= 128, 255, 0).astype(np.uint8)
+    return final_alpha
+
+
+def apply_floyd_steinberg(
+    image: Image.Image,
+    color_count: int,
+    preserve_transparency: bool,
+    hard_alpha: bool,
+) -> Image.Image:
+    """Aplica dithering Floyd–Steinberg colorido com paleta adaptativa."""
+    color_count = max(2, min(color_count, 256))
+    rgba_image = image.convert("RGBA")
+    source_pixels = np.asarray(rgba_image, dtype=np.uint8)
+    final_alpha = calculate_final_alpha(
+        source_pixels[:, :, 3], preserve_transparency, hard_alpha
+    )
+    visible_pixels = source_pixels[final_alpha > 0, :3]
+
+    if visible_pixels.size == 0:
+        return Image.new("RGBA", rgba_image.size, (0, 0, 0, 0))
+
+    # Limita a amostra mantendo intervalos regulares e determinísticos.
+    if len(visible_pixels) > 100_000:
+        sample_indices = np.linspace(
+            0, len(visible_pixels) - 1, num=100_000, dtype=np.intp
+        )
+        visible_pixels = visible_pixels[sample_indices]
+
+    palette_sample = Image.fromarray(visible_pixels.reshape(-1, 1, 3), mode="RGB")
+    palette_image = palette_sample.quantize(
+        colors=color_count,
+        method=Image.Quantize.MEDIANCUT,
+    )
+    quantized_image = rgba_image.convert("RGB").quantize(
+        colors=color_count,
+        dither=Image.Dither.FLOYDSTEINBERG,
+        palette=palette_image,
+    )
+
+    result_pixels = np.asarray(quantized_image.convert("RGB"), dtype=np.uint8).copy()
+    result_pixels[final_alpha == 0] = 0
+    result_image = Image.fromarray(result_pixels, mode="RGB").convert("RGBA")
+    result_image.putalpha(Image.fromarray(final_alpha, mode="L"))
+    return result_image
 
 
 class ImagePreviewWidget(QWidget):
@@ -262,13 +315,14 @@ class MainWindow(QMainWindow):
         """Conecta os controles que atualizam o resultado."""
         self.method_combo.currentTextChanged.connect(self._on_method_changed)
         self.threshold_slider.valueChanged.connect(self._on_threshold_changed)
+        self.colors_spinbox.valueChanged.connect(self._on_color_count_changed)
         self.preserve_alpha_checkbox.toggled.connect(self.update_result)
         self.hard_alpha_checkbox.toggled.connect(self.update_result)
 
     def _on_method_changed(self, method: str) -> None:
         """Atualiza o estado dos controles ao trocar de método."""
         self._update_control_states()
-        if method not in ("Nenhum", "Threshold"):
+        if method not in ("Nenhum", "Threshold", "Floyd–Steinberg"):
             self.statusBar().showMessage(
                 f'"{method}" será implementado posteriormente.', 4000
             )
@@ -281,12 +335,20 @@ class MainWindow(QMainWindow):
         self.threshold_label.setText(f"Limiar: {threshold}")
         self.update_result()
 
+    def _on_color_count_changed(self, color_count: int) -> None:
+        """Atualiza Floyd–Steinberg ao alterar a quantidade de cores."""
+        del color_count
+        if self.method_combo.currentText() == "Floyd–Steinberg":
+            self.update_result()
+
     def _update_control_states(self) -> None:
         """Ativa apenas os controles disponíveis para o método atual."""
-        is_threshold = self.method_combo.currentText() == "Threshold"
+        method = self.method_combo.currentText()
+        is_threshold = method == "Threshold"
+        is_floyd_steinberg = method == "Floyd–Steinberg"
         self.threshold_label.setEnabled(is_threshold)
         self.threshold_slider.setEnabled(is_threshold)
-        self.colors_spinbox.setEnabled(False)
+        self.colors_spinbox.setEnabled(is_floyd_steinberg)
 
     def import_image(self) -> None:
         """Abre uma imagem e a mostra nos dois painéis."""
@@ -328,6 +390,26 @@ class MainWindow(QMainWindow):
                 self.preserve_alpha_checkbox.isChecked(),
                 self.hard_alpha_checkbox.isChecked(),
             )
+        elif self.method_combo.currentText() == "Floyd–Steinberg":
+            self.statusBar().showMessage("Processando Floyd–Steinberg...")
+            QApplication.processEvents()
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                self.result_image = apply_floyd_steinberg(
+                    self.original_image,
+                    self.colors_spinbox.value(),
+                    self.preserve_alpha_checkbox.isChecked(),
+                    self.hard_alpha_checkbox.isChecked(),
+                )
+                self.statusBar().showMessage(
+                    f"Floyd–Steinberg aplicado com {self.colors_spinbox.value()} cores"
+                )
+            except Exception as error:
+                print(f"Erro ao aplicar Floyd–Steinberg: {error}", file=sys.stderr)
+                self.result_image = self.original_image.copy()
+                self.statusBar().showMessage("Não foi possível aplicar Floyd–Steinberg.")
+            finally:
+                QApplication.restoreOverrideCursor()
         else:
             self.result_image = self.original_image.copy()
 
