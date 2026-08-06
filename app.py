@@ -4,6 +4,9 @@ import sys
 import threading
 import traceback
 from collections.abc import Callable
+from dataclasses import dataclass
+import os
+from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageOps, UnidentifiedImageError
@@ -26,6 +29,72 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+
+@dataclass(frozen=True)
+class ProcessingSettings:
+    """Configurações capturadas para uma prévia ou exportação."""
+
+    method: str
+    color_count: int
+    threshold: int
+    noise_intensity: int
+    preserve_transparency: bool
+    hard_alpha: bool
+    noise_seed: int = 12345
+
+
+def apply_alpha_settings(
+    image: Image.Image,
+    preserve_transparency: bool,
+    hard_alpha: bool,
+) -> Image.Image:
+    """Aplica somente as opções de alfa a uma cópia RGBA."""
+    pixels = np.asarray(image.convert("RGBA"), dtype=np.uint8).copy()
+    pixels[:, :, 3] = calculate_final_alpha(
+        pixels[:, :, 3], preserve_transparency, hard_alpha
+    )
+    pixels[pixels[:, :, 3] == 0, :3] = 0
+    return Image.fromarray(pixels, mode="RGBA")
+
+
+def process_image_with_settings(
+    image: Image.Image,
+    settings: ProcessingSettings,
+    cancel_callback: Callable[[], bool] | None = None,
+) -> Image.Image:
+    """Processa uma imagem usando um conjunto fechado de configurações."""
+    method = settings.method
+    if method == "Nenhum":
+        return apply_alpha_settings(
+            image, settings.preserve_transparency, settings.hard_alpha
+        )
+    if method == "Threshold":
+        return apply_threshold(
+            image, settings.threshold, settings.preserve_transparency, settings.hard_alpha
+        )
+    if method == "Floyd–Steinberg":
+        return apply_floyd_steinberg(
+            image, settings.color_count, settings.preserve_transparency, settings.hard_alpha
+        )
+    if method == "Atkinson":
+        return apply_atkinson(
+            image, settings.color_count, settings.preserve_transparency,
+            settings.hard_alpha, cancel_callback
+        )
+    if method.startswith("Bayer "):
+        matrix_size = int(method.split()[1].split("x")[0])
+        return apply_bayer_dithering(
+            image, settings.color_count, matrix_size, settings.preserve_transparency,
+            settings.hard_alpha, cancel_callback
+        )
+    if method == "Ruído":
+        return apply_noise_dithering(
+            image, settings.color_count, settings.noise_intensity,
+            settings.preserve_transparency, settings.hard_alpha, settings.noise_seed,
+            cancel_callback
+        )
+    raise ValueError(f"Método de dithering desconhecido: {method}")
 
 
 def apply_threshold(
@@ -378,27 +447,22 @@ class ImageProcessingWorker(QObject):
     completed = Signal(int, object)
     failed = Signal(int, str)
     cancelled = Signal(int)
+    saving = Signal(int)
 
     def __init__(
         self,
         image: Image.Image,
-        color_count: int,
-        preserve_transparency: bool,
-        hard_alpha: bool,
+        settings: ProcessingSettings,
         generation: int,
-        method: str,
-        noise_intensity: int,
-        seed: int = 12345,
+        task_type: str = "preview",
+        export_path: Path | None = None,
     ) -> None:
         super().__init__()
         self._image = image
-        self._color_count = color_count
-        self._preserve_transparency = preserve_transparency
-        self._hard_alpha = hard_alpha
+        self._settings = settings
         self._generation = generation
-        self._method = method
-        self._noise_intensity = noise_intensity
-        self._seed = seed
+        self._task_type = task_type
+        self._export_path = export_path
         self._cancel_event = threading.Event()
 
     def request_cancel(self) -> None:
@@ -409,40 +473,42 @@ class ImageProcessingWorker(QObject):
     def run(self) -> None:
         """Processa e envia somente dados prontos para a janela."""
         try:
-            if self._method == "Atkinson":
-                result_image = apply_atkinson(
-                    self._image,
-                    self._color_count,
-                    self._preserve_transparency,
-                    self._hard_alpha,
-                    self._cancel_event.is_set,
-                )
-            elif self._method.startswith("Bayer "):
-                matrix_size = int(self._method.split()[1].split("x")[0])
-                result_image = apply_bayer_dithering(
-                    self._image,
-                    self._color_count,
-                    matrix_size,
-                    self._preserve_transparency,
-                    self._hard_alpha,
-                    self._cancel_event.is_set,
-                )
-            else:
-                result_image = apply_noise_dithering(
-                    self._image,
-                    self._color_count,
-                    self._noise_intensity,
-                    self._preserve_transparency,
-                    self._hard_alpha,
-                    self._seed,
-                    self._cancel_event.is_set,
-                )
+            result_image = process_image_with_settings(
+                self._image, self._settings, self._cancel_event.is_set
+            )
+            if self._cancel_event.is_set():
+                raise ProcessingCancelled()
+            if self._task_type == "export":
+                if self._export_path is None:
+                    raise ValueError("Caminho de exportação não informado.")
+                self.saving.emit(self._generation)
+                self._save_png(result_image)
+                self.completed.emit(self._generation, str(self._export_path))
+                return
         except ProcessingCancelled:
             self.cancelled.emit(self._generation)
         except Exception:
             self.failed.emit(self._generation, traceback.format_exc())
         else:
             self.completed.emit(self._generation, result_image)
+
+    def _save_png(self, image: Image.Image) -> None:
+        """Salva primeiro um PNG temporário e depois substitui o destino."""
+        if self._export_path is None:
+            raise ValueError("Caminho de exportação não informado.")
+        temporary_path = self._export_path.with_name(
+            f"{self._export_path.stem}.tmp.png"
+        )
+        try:
+            image.convert("RGBA").save(
+                temporary_path, format="PNG", optimize=False, compress_level=6
+            )
+            if self._cancel_event.is_set():
+                raise ProcessingCancelled()
+            os.replace(temporary_path, self._export_path)
+        finally:
+            if temporary_path.exists():
+                temporary_path.unlink()
 
 
 class ImagePreviewWidget(QWidget):
@@ -549,6 +615,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.original_image: Image.Image | None = None
         self.result_image: Image.Image | None = None
+        self.original_file_path: str | None = None
         self.processing_generation = 0
         self.atkinson_thread: QThread | None = None
         self.atkinson_worker: ImageProcessingWorker | None = None
@@ -556,6 +623,11 @@ class MainWindow(QMainWindow):
             int, str, Image.Image, int, int, bool, bool
         ] | None = None
         self._atkinson_processing = False
+        self._active_task_type = "preview"
+        self._pending_export_request: tuple[int, Image.Image, ProcessingSettings, Path] | None = None
+        self._exporting = False
+        self.export_generation = 0
+        self._active_export_path: Path | None = None
         self._is_closing = False
         self.noise_debounce_timer = QTimer(self)
         self.noise_debounce_timer.setSingleShot(True)
@@ -588,6 +660,7 @@ class MainWindow(QMainWindow):
         self.export_button.setEnabled(False)
         self.reset_button.setEnabled(False)
         self.import_button.clicked.connect(self.import_image)
+        self.export_button.clicked.connect(self.export_png)
         self.reset_button.clicked.connect(self.reset_application)
 
         toolbar_layout.addWidget(self.import_button)
@@ -758,9 +831,10 @@ class MainWindow(QMainWindow):
             return
 
         self.original_panel.preview.set_image(self.original_image)
+        self.original_file_path = file_path
         self.update_result()
         self.reset_button.setEnabled(self.atkinson_thread is None)
-        self.export_button.setEnabled(False)
+        self.export_button.setEnabled(True)
 
     def update_result(self) -> None:
         """Recalcula o resultado sempre a partir da imagem original."""
@@ -856,21 +930,27 @@ class MainWindow(QMainWindow):
         QApplication.processEvents()
         self._set_atkinson_processing_state(True)
 
+        settings = ProcessingSettings(
+            method=method,
+            color_count=color_count,
+            threshold=self.threshold_slider.value(),
+            noise_intensity=noise_intensity,
+            preserve_transparency=preserve_alpha,
+            hard_alpha=hard_alpha,
+        )
+
         thread = QThread(self)
         worker = ImageProcessingWorker(
             preview_image,
-            color_count,
-            preserve_alpha,
-            hard_alpha,
+            settings,
             generation,
-            method,
-            noise_intensity,
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.completed.connect(self._on_atkinson_completed)
         worker.failed.connect(self._on_atkinson_failed)
         worker.cancelled.connect(self._on_atkinson_cancelled)
+        worker.saving.connect(self._on_export_saving)
         worker.completed.connect(thread.quit, Qt.ConnectionType.DirectConnection)
         worker.failed.connect(thread.quit, Qt.ConnectionType.DirectConnection)
         worker.cancelled.connect(thread.quit, Qt.ConnectionType.DirectConnection)
@@ -891,8 +971,97 @@ class MainWindow(QMainWindow):
         if self.atkinson_worker is not None:
             self.atkinson_worker.request_cancel()
 
+    def _current_settings(self) -> ProcessingSettings:
+        """Captura as configurações atuais para um processamento isolado."""
+        return ProcessingSettings(
+            method=self.method_combo.currentText(),
+            color_count=self.colors_spinbox.value(),
+            threshold=self.threshold_slider.value(),
+            noise_intensity=self.noise_slider.value(),
+            preserve_transparency=self.preserve_alpha_checkbox.isChecked(),
+            hard_alpha=self.hard_alpha_checkbox.isChecked(),
+        )
+
+    def export_png(self) -> None:
+        """Pede o destino e agenda a exportação em resolução completa."""
+        if self.original_image is None or self._exporting:
+            return
+
+        default_name = "imagem_dithered.png"
+        if self.original_file_path is not None:
+            default_name = f"{Path(self.original_file_path).stem}_dithered.png"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Exportar PNG", default_name, "PNG (*.png)"
+        )
+        if not file_path:
+            return
+
+        export_path = Path(file_path)
+        if export_path.suffix.lower() != ".png":
+            export_path = export_path.with_suffix(".png")
+
+        self.export_generation += 1
+        self._pending_export_request = (
+            self.export_generation,
+            self.original_image.copy(),
+            self._current_settings(),
+            export_path,
+        )
+        self._set_export_state(True)
+        self._pending_atkinson_request = None
+        self._cancel_atkinson_processing()
+        if self.atkinson_thread is None:
+            request = self._pending_export_request
+            self._pending_export_request = None
+            self._start_export_worker(request)
+
+    def _start_export_worker(
+        self,
+        request: tuple[int, Image.Image, ProcessingSettings, Path] | None,
+    ) -> None:
+        """Inicia um worker de exportação depois do fim seguro da prévia."""
+        if request is None:
+            return
+        generation, image, settings, export_path = request
+        self._active_task_type = "export"
+        self._active_export_path = export_path
+        self.statusBar().showMessage(
+            "Processando imagem em resolução completa para exportação..."
+        )
+        if not self._atkinson_processing:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            self._atkinson_processing = True
+        QApplication.processEvents()
+
+        thread = QThread(self)
+        worker = ImageProcessingWorker(image, settings, generation, "export", export_path)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(self._on_atkinson_completed)
+        worker.failed.connect(self._on_atkinson_failed)
+        worker.cancelled.connect(self._on_atkinson_cancelled)
+        worker.saving.connect(self._on_export_saving)
+        worker.completed.connect(thread.quit, Qt.ConnectionType.DirectConnection)
+        worker.failed.connect(thread.quit, Qt.ConnectionType.DirectConnection)
+        worker.cancelled.connect(thread.quit, Qt.ConnectionType.DirectConnection)
+        worker.completed.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        worker.cancelled.connect(worker.deleteLater)
+        thread.finished.connect(self._on_atkinson_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        self.atkinson_thread = thread
+        self.atkinson_worker = worker
+        thread.start()
+
     def _on_atkinson_completed(self, generation: int, result_image: Image.Image) -> None:
         """Aplica somente o resultado correspondente à configuração atual."""
+        if self._active_task_type == "export":
+            if generation == self.export_generation:
+                exported_name = Path(str(result_image)).name
+                self.statusBar().showMessage(
+                    f"PNG exportado com sucesso: {exported_name}", 5000
+                )
+            return
         if (
             generation != self.processing_generation
             or not self._is_background_method(self.method_combo.currentText())
@@ -911,9 +1080,25 @@ class MainWindow(QMainWindow):
             )
         )
 
+    def _on_export_saving(self, generation: int) -> None:
+        """Atualiza o status quando o worker inicia a gravação do PNG."""
+        if self._active_task_type == "export" and generation == self.export_generation:
+            self.statusBar().showMessage("Salvando PNG...")
+
     def _on_atkinson_failed(self, generation: int, error_details: str) -> None:
         """Restaura uma cópia segura quando o worker falha."""
         print(f"Erro no processamento de imagem:\n{error_details}", file=sys.stderr)
+        if self._active_task_type == "export":
+            if generation == self.export_generation:
+                self.statusBar().showMessage("Não foi possível exportar o PNG.")
+                QMessageBox.critical(
+                    self,
+                    "Erro ao exportar PNG",
+                    "Não foi possível salvar o PNG solicitado:\n"
+                    f"{self._active_export_path}\n\n"
+                    "Verifique o caminho, permissões e espaço em disco.",
+                )
+            return
         if generation != self.processing_generation or self.original_image is None:
             return
 
@@ -923,6 +1108,9 @@ class MainWindow(QMainWindow):
 
     def _on_atkinson_cancelled(self, generation: int) -> None:
         """Informa um cancelamento apenas quando ele ainda é relevante."""
+        if self._active_task_type == "export" and generation == self.export_generation:
+            self.statusBar().showMessage("Exportação cancelada.")
+            return
         if generation == self.processing_generation and not self._is_closing:
             self.statusBar().showMessage("Processamento cancelado.")
 
@@ -934,6 +1122,11 @@ class MainWindow(QMainWindow):
 
         self.atkinson_thread = None
         self.atkinson_worker = None
+        if self._pending_export_request is not None and not self._is_closing:
+            export_request = self._pending_export_request
+            self._pending_export_request = None
+            self._start_export_worker(export_request)
+            return
         pending_request = self._pending_atkinson_request
         self._pending_atkinson_request = None
 
@@ -947,6 +1140,10 @@ class MainWindow(QMainWindow):
             return
 
         self._set_atkinson_processing_state(False)
+        if self._active_task_type == "export":
+            self._set_export_state(False)
+            self._active_task_type = "preview"
+            self._active_export_path = None
         if self._atkinson_processing:
             QApplication.restoreOverrideCursor()
             self._atkinson_processing = False
@@ -956,6 +1153,27 @@ class MainWindow(QMainWindow):
         self.import_button.setEnabled(not is_processing)
         self.reset_button.setEnabled(not is_processing and self.original_image is not None)
 
+    def _set_export_state(self, is_exporting: bool) -> None:
+        """Bloqueia controles enquanto a exportação usa as opções capturadas."""
+        self._exporting = is_exporting
+        controls = (
+            self.import_button, self.export_button, self.reset_button,
+            self.method_combo, self.colors_spinbox, self.threshold_slider,
+            self.noise_slider, self.preserve_alpha_checkbox, self.hard_alpha_checkbox,
+        )
+        if is_exporting:
+            for control in controls:
+                control.setEnabled(False)
+            return
+
+        self.import_button.setEnabled(True)
+        self.export_button.setEnabled(self.original_image is not None)
+        self.reset_button.setEnabled(self.original_image is not None)
+        self.method_combo.setEnabled(True)
+        self.preserve_alpha_checkbox.setEnabled(True)
+        self.hard_alpha_checkbox.setEnabled(True)
+        self._update_control_states()
+
     def reset_application(self) -> None:
         """Limpa as imagens e restaura os controles aos valores iniciais."""
         self.processing_generation += 1
@@ -963,6 +1181,7 @@ class MainWindow(QMainWindow):
         self.noise_debounce_timer.stop()
         self.original_image = None
         self.result_image = None
+        self.original_file_path = None
         self.original_panel.preview.set_image(None)
         self.result_panel.preview.set_image(None)
         self.reset_button.setEnabled(False)
