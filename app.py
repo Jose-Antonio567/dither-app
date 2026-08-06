@@ -99,6 +99,21 @@ def create_adaptive_palette(
     return palette_image, palette_values[used_indices]
 
 
+def create_color_lut(palette_colors: np.ndarray) -> np.ndarray:
+    """Monta uma LUT RGB de 5 bits para a cor mais próxima da paleta."""
+    color_levels = np.linspace(0, 255, num=32, dtype=np.float32)
+    red, green, blue = np.meshgrid(
+        color_levels, color_levels, color_levels, indexing="ij"
+    )
+    lut_samples = np.stack((red, green, blue), axis=-1).reshape(-1, 3)
+    color_distances = np.sum(
+        (lut_samples[:, np.newaxis, :] - palette_colors[np.newaxis, :, :]) ** 2,
+        axis=2,
+    )
+    nearest_indices = np.argmin(color_distances, axis=1)
+    return palette_colors[nearest_indices].reshape(32, 32, 32, 3)
+
+
 def apply_floyd_steinberg(
     image: Image.Image,
     color_count: int,
@@ -157,15 +172,7 @@ def apply_atkinson(
         return Image.new("RGBA", rgba_image.size, (0, 0, 0, 0))
 
     # A LUT de 5 bits evita recalcular a distância para a paleta por pixel.
-    color_levels = np.linspace(0, 255, num=32, dtype=np.float32)
-    red, green, blue = np.meshgrid(color_levels, color_levels, color_levels, indexing="ij")
-    lut_samples = np.stack((red, green, blue), axis=-1).reshape(-1, 3)
-    color_distances = np.sum(
-        (lut_samples[:, np.newaxis, :] - palette_colors[np.newaxis, :, :]) ** 2,
-        axis=2,
-    )
-    nearest_indices = np.argmin(color_distances, axis=1)
-    color_lut = palette_colors[nearest_indices].reshape(32, 32, 32, 3)
+    color_lut = create_color_lut(palette_colors)
 
     height, width = final_alpha.shape
     visible_mask = final_alpha > 0
@@ -203,6 +210,81 @@ def apply_atkinson(
     return result_image
 
 
+def generate_bayer_matrix(size: int) -> np.ndarray:
+    """Gera e normaliza uma matriz Bayer de tamanho 2, 4 ou 8."""
+    if size not in (2, 4, 8):
+        raise ValueError("O tamanho da matriz Bayer deve ser 2, 4 ou 8.")
+
+    matrix = np.array([[0, 2], [3, 1]], dtype=np.float32)
+    while matrix.shape[0] < size:
+        matrix = np.block(
+            [[4 * matrix, 4 * matrix + 2], [4 * matrix + 3, 4 * matrix + 1]]
+        )
+    return (matrix + 0.5) / (size * size) - 0.5
+
+
+def apply_bayer_dithering(
+    image: Image.Image,
+    color_count: int,
+    matrix_size: int,
+    preserve_transparency: bool,
+    hard_alpha: bool,
+    should_cancel: Callable[[], bool] | None = None,
+) -> Image.Image:
+    """Aplica dithering Bayer colorido sem percorrer pixel por pixel."""
+    if should_cancel is not None and should_cancel():
+        raise ProcessingCancelled()
+
+    color_count = max(2, min(color_count, 256))
+    rgba_image = image.convert("RGBA")
+    source_pixels = np.asarray(rgba_image, dtype=np.uint8)
+    final_alpha = calculate_final_alpha(
+        source_pixels[:, :, 3], preserve_transparency, hard_alpha
+    )
+    _, palette_colors = create_adaptive_palette(
+        source_pixels, final_alpha, color_count
+    )
+    if should_cancel is not None and should_cancel():
+        raise ProcessingCancelled()
+    if palette_colors.size == 0:
+        return Image.new("RGBA", rgba_image.size, (0, 0, 0, 0))
+
+    color_lut = create_color_lut(palette_colors)
+    if should_cancel is not None and should_cancel():
+        raise ProcessingCancelled()
+
+    height, width = final_alpha.shape
+    normalized_matrix = generate_bayer_matrix(matrix_size)
+    threshold_map = normalized_matrix[
+        np.arange(height)[:, np.newaxis] % matrix_size,
+        np.arange(width)[np.newaxis, :] % matrix_size,
+    ]
+    levels_per_channel = max(2.0, color_count ** (1.0 / 3.0))
+    amplitude = 255.0 / (levels_per_channel - 1.0)
+    adjusted_rgb = np.clip(
+        source_pixels[:, :, :3].astype(np.float32) + threshold_map[:, :, np.newaxis] * amplitude,
+        0,
+        255,
+    )
+    if should_cancel is not None and should_cancel():
+        raise ProcessingCancelled()
+
+    lookup_indices = np.clip((adjusted_rgb * 31 / 255).astype(np.intp), 0, 31)
+    result_rgb = np.zeros_like(source_pixels[:, :, :3])
+    visible_mask = final_alpha > 0
+    result_rgb[visible_mask] = color_lut[
+        lookup_indices[:, :, 0][visible_mask],
+        lookup_indices[:, :, 1][visible_mask],
+        lookup_indices[:, :, 2][visible_mask],
+    ]
+    if should_cancel is not None and should_cancel():
+        raise ProcessingCancelled()
+
+    result_image = Image.fromarray(result_rgb, mode="RGB").convert("RGBA")
+    result_image.putalpha(Image.fromarray(final_alpha, mode="L"))
+    return result_image
+
+
 def create_atkinson_preview(image: Image.Image) -> Image.Image:
     """Cria uma cópia reduzida para a pré-visualização do Atkinson."""
     maximum_dimension = 1200
@@ -219,8 +301,8 @@ def create_atkinson_preview(image: Image.Image) -> Image.Image:
     return image.resize(preview_size, Image.Resampling.LANCZOS)
 
 
-class AtkinsonWorker(QObject):
-    """Executa o Atkinson fora da thread da interface."""
+class ImageProcessingWorker(QObject):
+    """Executa Atkinson ou Bayer fora da thread da interface."""
 
     completed = Signal(int, object)
     failed = Signal(int, str)
@@ -233,6 +315,7 @@ class AtkinsonWorker(QObject):
         preserve_transparency: bool,
         hard_alpha: bool,
         generation: int,
+        method: str,
     ) -> None:
         super().__init__()
         self._image = image
@@ -240,6 +323,7 @@ class AtkinsonWorker(QObject):
         self._preserve_transparency = preserve_transparency
         self._hard_alpha = hard_alpha
         self._generation = generation
+        self._method = method
         self._cancel_event = threading.Event()
 
     def request_cancel(self) -> None:
@@ -250,13 +334,24 @@ class AtkinsonWorker(QObject):
     def run(self) -> None:
         """Processa e envia somente dados prontos para a janela."""
         try:
-            result_image = apply_atkinson(
-                self._image,
-                self._color_count,
-                self._preserve_transparency,
-                self._hard_alpha,
-                self._cancel_event.is_set,
-            )
+            if self._method == "Atkinson":
+                result_image = apply_atkinson(
+                    self._image,
+                    self._color_count,
+                    self._preserve_transparency,
+                    self._hard_alpha,
+                    self._cancel_event.is_set,
+                )
+            else:
+                matrix_size = int(self._method.split()[1].split("x")[0])
+                result_image = apply_bayer_dithering(
+                    self._image,
+                    self._color_count,
+                    matrix_size,
+                    self._preserve_transparency,
+                    self._hard_alpha,
+                    self._cancel_event.is_set,
+                )
         except ProcessingCancelled:
             self.cancelled.emit(self._generation)
         except Exception:
@@ -371,9 +466,9 @@ class MainWindow(QMainWindow):
         self.result_image: Image.Image | None = None
         self.processing_generation = 0
         self.atkinson_thread: QThread | None = None
-        self.atkinson_worker: AtkinsonWorker | None = None
+        self.atkinson_worker: ImageProcessingWorker | None = None
         self._pending_atkinson_request: tuple[
-            int, Image.Image, int, bool, bool
+            int, str, Image.Image, int, bool, bool
         ] | None = None
         self._atkinson_processing = False
         self._is_closing = False
@@ -483,7 +578,10 @@ class MainWindow(QMainWindow):
     def _on_method_changed(self, method: str) -> None:
         """Atualiza o estado dos controles ao trocar de método."""
         self._update_control_states()
-        if method not in ("Nenhum", "Threshold", "Floyd–Steinberg", "Atkinson"):
+        if method not in (
+            "Nenhum", "Threshold", "Floyd–Steinberg", "Atkinson",
+            "Bayer 2x2", "Bayer 4x4", "Bayer 8x8",
+        ):
             self.statusBar().showMessage(
                 f'"{method}" será implementado posteriormente.', 4000
             )
@@ -499,17 +597,26 @@ class MainWindow(QMainWindow):
     def _on_color_count_changed(self, color_count: int) -> None:
         """Atualiza os métodos que usam quantidade de cores."""
         del color_count
-        if self.method_combo.currentText() in ("Floyd–Steinberg", "Atkinson"):
+        if self.method_combo.currentText() in (
+            "Floyd–Steinberg", "Atkinson", "Bayer 2x2", "Bayer 4x4", "Bayer 8x8",
+        ):
             self.update_result()
 
     def _update_control_states(self) -> None:
         """Ativa apenas os controles disponíveis para o método atual."""
         method = self.method_combo.currentText()
         is_threshold = method == "Threshold"
-        uses_color_count = method in ("Floyd–Steinberg", "Atkinson")
+        uses_color_count = method in (
+            "Floyd–Steinberg", "Atkinson", "Bayer 2x2", "Bayer 4x4", "Bayer 8x8",
+        )
         self.threshold_label.setEnabled(is_threshold)
         self.threshold_slider.setEnabled(is_threshold)
         self.colors_spinbox.setEnabled(uses_color_count)
+
+    @staticmethod
+    def _is_background_method(method: str) -> bool:
+        """Indica os métodos atendidos pelo worker compartilhado."""
+        return method in ("Atkinson", "Bayer 2x2", "Bayer 4x4", "Bayer 8x8")
 
     def import_image(self) -> None:
         """Abre uma imagem e a mostra nos dois painéis."""
@@ -575,7 +682,9 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage("Não foi possível aplicar Floyd–Steinberg.")
             finally:
                 QApplication.restoreOverrideCursor()
-        elif self.method_combo.currentText() == "Atkinson":
+        elif self.method_combo.currentText() in (
+            "Atkinson", "Bayer 2x2", "Bayer 4x4", "Bayer 8x8",
+        ):
             self._request_atkinson_processing(generation)
             return
         else:
@@ -585,12 +694,13 @@ class MainWindow(QMainWindow):
         self.result_panel.preview.set_image(self.result_image)
 
     def _request_atkinson_processing(self, generation: int) -> None:
-        """Inicia ou agenda a versão mais recente do processamento Atkinson."""
+        """Inicia ou agenda a versão mais recente do processamento em segundo plano."""
         if self.original_image is None:
             return
 
         request = (
             generation,
+            self.method_combo.currentText(),
             create_atkinson_preview(self.original_image),
             self.colors_spinbox.value(),
             self.preserve_alpha_checkbox.isChecked(),
@@ -605,11 +715,11 @@ class MainWindow(QMainWindow):
 
     def _start_atkinson_worker(
         self,
-        request: tuple[int, Image.Image, int, bool, bool],
+        request: tuple[int, str, Image.Image, int, bool, bool],
     ) -> None:
         """Cria um worker e mantém suas referências até o fim da thread."""
-        generation, preview_image, color_count, preserve_alpha, hard_alpha = request
-        self.statusBar().showMessage("Processando Atkinson...")
+        generation, method, preview_image, color_count, preserve_alpha, hard_alpha = request
+        self.statusBar().showMessage(f"Processando {method}...")
         if not self._atkinson_processing:
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
             self._atkinson_processing = True
@@ -617,12 +727,13 @@ class MainWindow(QMainWindow):
         self._set_atkinson_processing_state(True)
 
         thread = QThread(self)
-        worker = AtkinsonWorker(
+        worker = ImageProcessingWorker(
             preview_image,
             color_count,
             preserve_alpha,
             hard_alpha,
             generation,
+            method,
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -653,30 +764,31 @@ class MainWindow(QMainWindow):
         """Aplica somente o resultado correspondente à configuração atual."""
         if (
             generation != self.processing_generation
-            or self.method_combo.currentText() != "Atkinson"
+            or not self._is_background_method(self.method_combo.currentText())
         ):
             return
 
         self.result_image = result_image
         self.result_panel.preview.set_image(self.result_image)
         self.statusBar().showMessage(
-            f"Atkinson aplicado com {self.colors_spinbox.value()} cores"
+            f"{self.method_combo.currentText()} aplicado com "
+            f"{self.colors_spinbox.value()} cores"
         )
 
     def _on_atkinson_failed(self, generation: int, error_details: str) -> None:
         """Restaura uma cópia segura quando o worker falha."""
-        print(f"Erro ao aplicar Atkinson:\n{error_details}", file=sys.stderr)
+        print(f"Erro no processamento de imagem:\n{error_details}", file=sys.stderr)
         if generation != self.processing_generation or self.original_image is None:
             return
 
         self.result_image = self.original_image.copy()
         self.result_panel.preview.set_image(self.result_image)
-        self.statusBar().showMessage("Não foi possível aplicar Atkinson.")
+        self.statusBar().showMessage("Não foi possível aplicar o método selecionado.")
 
     def _on_atkinson_cancelled(self, generation: int) -> None:
         """Informa um cancelamento apenas quando ele ainda é relevante."""
         if generation == self.processing_generation and not self._is_closing:
-            self.statusBar().showMessage("Processamento Atkinson cancelado.")
+            self.statusBar().showMessage("Processamento cancelado.")
 
     def _on_atkinson_thread_finished(self) -> None:
         """Libera referências e inicia, se houver, a última solicitação pendente."""
@@ -692,7 +804,7 @@ class MainWindow(QMainWindow):
         if (
             pending_request is not None
             and pending_request[0] == self.processing_generation
-            and self.method_combo.currentText() == "Atkinson"
+            and self._is_background_method(self.method_combo.currentText())
             and not self._is_closing
         ):
             self._start_atkinson_worker(pending_request)
