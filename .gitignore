@@ -3,5 +3,7 @@ __pycache__/
 *.pyc
 build/
 dist/
+release/
+assets/app_icon.ico
 !DitherApp.spec
 .vscode/
