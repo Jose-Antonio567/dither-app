@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageOps, UnidentifiedImageError
 from PySide6.QtCore import QObject, QRect, QSignalBlocker, QThread, QTimer, Qt, Signal, Slot
-from PySide6.QtGui import QCloseEvent, QColor, QImage, QMouseEvent, QPainter
+from PySide6.QtGui import QAction, QCloseEvent, QColor, QImage, QKeySequence, QMouseEvent, QPainter
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QProgressBar,
     QSizePolicy,
     QSlider,
     QSpinBox,
@@ -712,8 +713,15 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Dither App")
         self.resize(1200, 760)
         self.setMinimumSize(900, 600)
+        self.setAcceptDrops(True)
 
         self._create_interface()
+        self._create_actions()
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMinimumWidth(130)
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setVisible(False)
+        self.statusBar().addPermanentWidget(self.progress_bar)
         self._apply_styles()
         self._connect_controls()
         self._update_control_states()
@@ -733,15 +741,20 @@ class MainWindow(QMainWindow):
         self.import_button = QPushButton("Importar imagem")
         self.export_button = QPushButton("Exportar PNG")
         self.reset_button = QPushButton("Redefinir")
+        self.compare_button = QPushButton("Segure para comparar")
         self.export_button.setEnabled(False)
         self.reset_button.setEnabled(False)
+        self.compare_button.setEnabled(False)
         self.import_button.clicked.connect(self.import_image)
         self.export_button.clicked.connect(self.export_png)
         self.reset_button.clicked.connect(self.reset_application)
+        self.compare_button.pressed.connect(self._show_original_for_comparison)
+        self.compare_button.released.connect(self._restore_result_after_comparison)
 
         toolbar_layout.addWidget(self.import_button)
         toolbar_layout.addWidget(self.export_button)
         toolbar_layout.addWidget(self.reset_button)
+        toolbar_layout.addWidget(self.compare_button)
         toolbar_layout.addStretch()
         main_layout.addLayout(toolbar_layout)
 
@@ -924,6 +937,43 @@ class MainWindow(QMainWindow):
         """Indica os métodos atendidos pelo worker compartilhado."""
         return method in ("Atkinson", "Bayer 2x2", "Bayer 4x4", "Bayer 8x8", "Ruído")
 
+    def _create_actions(self) -> None:
+        """Cria ações de menu e atalhos globais."""
+        self.open_action = QAction("Abrir imagem...", self); self.open_action.setShortcut(QKeySequence.StandardKey.Open)
+        self.export_action = QAction("Exportar PNG...", self); self.export_action.setShortcut(QKeySequence("Ctrl+Shift+S"))
+        self.reset_action = QAction("Redefinir", self); self.reset_action.setShortcut(QKeySequence("Ctrl+R"))
+        self.exit_action = QAction("Sair", self); self.exit_action.setShortcut(QKeySequence("Ctrl+Q"))
+        for action in (self.open_action, self.export_action, self.reset_action, self.exit_action): action.setShortcutContext(Qt.ShortcutContext.WindowShortcut); self.addAction(action)
+        self.export_action.setEnabled(False); self.reset_action.setEnabled(False)
+        self.open_action.triggered.connect(self.import_image); self.export_action.triggered.connect(self.export_png); self.reset_action.triggered.connect(self.reset_application); self.exit_action.triggered.connect(self.close)
+        file_menu = self.menuBar().addMenu("Arquivo")
+        for action in (self.open_action, self.export_action, self.reset_action, self.exit_action): file_menu.addAction(action)
+
+    def _show_original_for_comparison(self) -> None:
+        if self.original_image is not None: self.result_panel.preview.set_image(self.original_image)
+
+    def _restore_result_after_comparison(self) -> None:
+        self.result_panel.preview.set_image(self.result_image or self.original_image)
+
+    def _get_first_supported_dropped_file(self, mime_data: object) -> str | None:
+        if not mime_data.hasUrls(): return None
+        for url in mime_data.urls():
+            path = url.toLocalFile()
+            if path and Path(path).suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}: return path
+        return None
+
+    def dragEnterEvent(self, event: object) -> None:
+        if self._get_first_supported_dropped_file(event.mimeData()): event.setDropAction(Qt.DropAction.CopyAction); event.accept()
+        else: event.ignore()
+
+    def dragMoveEvent(self, event: object) -> None:
+        self.dragEnterEvent(event)
+
+    def dropEvent(self, event: object) -> None:
+        path = self._get_first_supported_dropped_file(event.mimeData())
+        if path: self.load_image_from_path(path); event.acceptProposedAction()
+        else: event.ignore()
+
     def import_image(self) -> None:
         """Abre uma imagem e a mostra nos dois painéis."""
         file_path, _ = QFileDialog.getOpenFileName(
@@ -935,6 +985,10 @@ class MainWindow(QMainWindow):
         if not file_path:
             return
 
+        self.load_image_from_path(file_path)
+
+    def load_image_from_path(self, file_path: str) -> None:
+        """Carrega a imagem usada por diálogo e arrastar/soltar."""
         try:
             with Image.open(file_path) as opened_image:
                 corrected_image = ImageOps.exif_transpose(opened_image)
@@ -952,6 +1006,9 @@ class MainWindow(QMainWindow):
         self.update_result()
         self.reset_button.setEnabled(self.atkinson_thread is None)
         self.export_button.setEnabled(True)
+        self.compare_button.setEnabled(True)
+        self.export_action.setEnabled(True)
+        self.reset_action.setEnabled(True)
 
     def update_result(self) -> None:
         """Recalcula o resultado sempre a partir da imagem original."""
@@ -1046,7 +1103,7 @@ class MainWindow(QMainWindow):
             if method == "Ruído"
             else f"Processando {method}..."
         )
-        self.statusBar().showMessage(processing_message)
+        self._show_processing(processing_message)
         if not self._atkinson_processing:
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
             self._atkinson_processing = True
@@ -1145,7 +1202,7 @@ class MainWindow(QMainWindow):
         generation, image, settings, export_path = request
         self._active_task_type = "export"
         self._active_export_path = export_path
-        self.statusBar().showMessage(
+        self._show_processing(
             "Processando imagem em resolução completa para exportação..."
         )
         if not self._atkinson_processing:
@@ -1260,6 +1317,7 @@ class MainWindow(QMainWindow):
             return
 
         self._set_atkinson_processing_state(False)
+        self._hide_processing()
         if self._active_task_type == "export":
             self._set_export_state(False)
             self._active_task_type = "preview"
@@ -1272,6 +1330,17 @@ class MainWindow(QMainWindow):
         """Mantém apenas os botões de arquivo indisponíveis durante o trabalho."""
         self.import_button.setEnabled(not is_processing)
         self.reset_button.setEnabled(not is_processing and self.original_image is not None)
+        self.compare_button.setEnabled(not is_processing and self.original_image is not None)
+        self.reset_action.setEnabled(not is_processing and self.original_image is not None)
+
+    def _show_processing(self, message: str) -> None:
+        self.statusBar().showMessage(message)
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setVisible(True)
+        QApplication.processEvents()
+
+    def _hide_processing(self) -> None:
+        self.progress_bar.setVisible(False)
 
     def _set_export_state(self, is_exporting: bool) -> None:
         """Bloqueia controles enquanto a exportação usa as opções capturadas."""
@@ -1309,6 +1378,9 @@ class MainWindow(QMainWindow):
         self.result_panel.preview.set_image(None)
         self.reset_button.setEnabled(False)
         self.export_button.setEnabled(False)
+        self.compare_button.setEnabled(False)
+        self.export_action.setEnabled(False)
+        self.reset_action.setEnabled(False)
 
         controls = (
             self.method_combo,
