@@ -49,6 +49,22 @@ class ProcessingSettings:
     background_color: tuple[int, int, int] = (255, 255, 255)
     background_tolerance: int = 30
     background_connected_only: bool = True
+    pixel_scale: int = 1
+
+
+def downscale_for_pixel_scale(image: Image.Image, pixel_scale: int) -> Image.Image:
+    """Reduz RGBA com BOX para o estágio de Pixel Scale."""
+    pixel_scale = max(1, min(12, int(pixel_scale)))
+    rgba_image = image.convert("RGBA")
+    if pixel_scale == 1:
+        return rgba_image.copy()
+    size = (max(1, round(rgba_image.width / pixel_scale)), max(1, round(rgba_image.height / pixel_scale)))
+    return rgba_image.resize(size, Image.Resampling.BOX)
+
+
+def upscale_pixelated(image: Image.Image, target_size: tuple[int, int]) -> Image.Image:
+    """Restaura o tamanho com pixels nítidos."""
+    return image.convert("RGBA").resize(target_size, Image.Resampling.NEAREST)
 
 
 def remove_background_by_color(
@@ -115,35 +131,41 @@ def process_image_with_settings(
             image, settings.background_color, settings.background_tolerance,
             settings.background_connected_only, cancel_callback
         )
+    target_size = working_image.size
+    use_pixel_scale = method != "Nenhum" and max(1, min(12, int(settings.pixel_scale))) > 1
+    if use_pixel_scale:
+        working_image = downscale_for_pixel_scale(working_image, settings.pixel_scale)
+    def finish(result: Image.Image) -> Image.Image:
+        return upscale_pixelated(result, target_size) if use_pixel_scale else result
     if method == "Nenhum":
-        return apply_alpha_settings(
+        return finish(apply_alpha_settings(
             working_image, settings.preserve_transparency, settings.hard_alpha
-        )
+        ))
     if method == "Threshold":
-        return apply_threshold(
+        return finish(apply_threshold(
             working_image, settings.threshold, settings.preserve_transparency, settings.hard_alpha
-        )
+        ))
     if method == "Floyd–Steinberg":
-        return apply_floyd_steinberg(
+        return finish(apply_floyd_steinberg(
             working_image, settings.color_count, settings.preserve_transparency, settings.hard_alpha
-        )
+        ))
     if method == "Atkinson":
-        return apply_atkinson(
+        return finish(apply_atkinson(
             working_image, settings.color_count, settings.preserve_transparency,
             settings.hard_alpha, cancel_callback
-        )
+        ))
     if method.startswith("Bayer "):
         matrix_size = int(method.split()[1].split("x")[0])
-        return apply_bayer_dithering(
+        return finish(apply_bayer_dithering(
             working_image, settings.color_count, matrix_size, settings.preserve_transparency,
             settings.hard_alpha, cancel_callback
-        )
+        ))
     if method == "Ruído":
-        return apply_noise_dithering(
+        return finish(apply_noise_dithering(
             working_image, settings.color_count, settings.noise_intensity,
             settings.preserve_transparency, settings.hard_alpha, settings.noise_seed,
             cancel_callback
-        )
+        ))
     raise ValueError(f"Método de dithering desconhecido: {method}")
 
 
@@ -707,6 +729,9 @@ class MainWindow(QMainWindow):
         self.noise_debounce_timer = QTimer(self)
         self.noise_debounce_timer.setSingleShot(True)
         self.noise_debounce_timer.setInterval(180)
+        self.pixel_scale_debounce_timer = QTimer(self)
+        self.pixel_scale_debounce_timer.setSingleShot(True)
+        self.pixel_scale_debounce_timer.setInterval(150)
         self.background_debounce_timer = QTimer(self)
         self.background_debounce_timer.setSingleShot(True)
         self.background_debounce_timer.setInterval(150)
@@ -807,6 +832,15 @@ class MainWindow(QMainWindow):
         self.colors_spinbox.setValue(16)
         layout.addWidget(self.colors_spinbox)
 
+        self.pixel_scale_label = QLabel("Pixel Scale: 1x")
+        self.pixel_scale_slider = QSlider(Qt.Orientation.Horizontal)
+        self.pixel_scale_slider.setRange(1, 12)
+        self.pixel_scale_slider.setValue(1)
+        self.pixel_scale_slider.setToolTip("Aumenta o tamanho visual dos pixels reduzindo a resolução do processamento.")
+        self.pixel_scale_slider.setAccessibleName("Escala de pixels")
+        layout.addWidget(self.pixel_scale_label)
+        layout.addWidget(self.pixel_scale_slider)
+
         self.threshold_label = QLabel("Limiar: 128")
         self.threshold_slider = QSlider(Qt.Orientation.Horizontal)
         self.threshold_slider.setRange(0, 255)
@@ -842,7 +876,9 @@ class MainWindow(QMainWindow):
         self.method_combo.currentTextChanged.connect(self._on_method_changed)
         self.threshold_slider.valueChanged.connect(self._on_threshold_changed)
         self.noise_slider.valueChanged.connect(self._on_noise_intensity_changed)
+        self.pixel_scale_slider.valueChanged.connect(self._on_pixel_scale_changed)
         self.noise_debounce_timer.timeout.connect(self._apply_debounced_noise_update)
+        self.pixel_scale_debounce_timer.timeout.connect(self.update_result)
         self.colors_spinbox.valueChanged.connect(self._on_color_count_changed)
         self.preserve_alpha_checkbox.toggled.connect(self.update_result)
         self.hard_alpha_checkbox.toggled.connect(self.update_result)
@@ -882,6 +918,12 @@ class MainWindow(QMainWindow):
             self.processing_generation += 1
             self._cancel_atkinson_processing()
             self.noise_debounce_timer.start()
+
+    def _on_pixel_scale_changed(self, value: int) -> None:
+        """Atualiza o texto e adia a prévia durante o arraste."""
+        self.pixel_scale_label.setText(f"Pixel Scale: {value}x")
+        if self.method_combo.currentText() != "Nenhum":
+            self.pixel_scale_debounce_timer.start()
 
     def _on_background_changed(self) -> None:
         self._update_background_controls()
@@ -933,6 +975,8 @@ class MainWindow(QMainWindow):
         self.threshold_label.setEnabled(is_threshold)
         self.threshold_slider.setEnabled(is_threshold)
         self.colors_spinbox.setEnabled(uses_color_count)
+        self.pixel_scale_label.setEnabled(method != "Nenhum")
+        self.pixel_scale_slider.setEnabled(method != "Nenhum")
         self.noise_label.setEnabled(is_noise)
         self.noise_slider.setEnabled(is_noise)
 
@@ -1161,6 +1205,7 @@ class MainWindow(QMainWindow):
             background_color=self.background_color,
             background_tolerance=self.background_tolerance_slider.value(),
             background_connected_only=self.background_connected_checkbox.isChecked(),
+            pixel_scale=self.pixel_scale_slider.value(),
         )
 
     def export_png(self) -> None:
@@ -1372,6 +1417,7 @@ class MainWindow(QMainWindow):
         self.processing_generation += 1
         self._cancel_atkinson_processing()
         self.noise_debounce_timer.stop()
+        self.pixel_scale_debounce_timer.stop()
         self.background_debounce_timer.stop()
         self.eyedropper_active = False
         self.original_panel.preview.unsetCursor()
@@ -1398,6 +1444,8 @@ class MainWindow(QMainWindow):
         self.method_combo.setCurrentText("Nenhum")
         self.threshold_slider.setValue(128)
         self.noise_slider.setValue(50)
+        self.pixel_scale_slider.setValue(1)
+        self.pixel_scale_label.setText("Pixel Scale: 1x")
         self.noise_label.setText("Intensidade do ruído: 50%")
         self.colors_spinbox.setValue(16)
         self.preserve_alpha_checkbox.setChecked(True)
