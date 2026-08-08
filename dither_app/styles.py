@@ -16,4 +16,8 @@ QSlider::handle:horizontal { width: 15px; margin: -5px 0; background: #5b9bd5; b
 QStatusBar { background: #292b2f; border-top: 1px solid #3b3e44; }
 QProgressBar { border: 1px solid #50535a; border-radius: 3px; background: #202124; }
 QProgressBar::chunk { background: #5b9bd5; }
+QListWidget { background: #202124; border: 1px solid #50535a; border-radius: 4px; padding: 3px; }
+QListWidget::item { border-radius: 4px; padding: 4px; }
+QListWidget::item:hover { background: #30343a; }
+QListWidget::item:selected { background: #3a6ea5; color: white; }
 """

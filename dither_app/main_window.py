@@ -11,8 +11,8 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageOps, UnidentifiedImageError
-from PySide6.QtCore import QObject, QRect, QSettings, QSignalBlocker, QThread, QTimer, Qt, Signal, Slot
-from PySide6.QtGui import QAction, QCloseEvent, QColor, QIcon, QImage, QKeySequence, QMouseEvent, QPainter
+from PySide6.QtCore import QObject, QRect, QSettings, QSignalBlocker, QSize, QThread, QTimer, Qt, Signal, Slot
+from PySide6.QtGui import QAction, QCloseEvent, QColor, QIcon, QImage, QKeySequence, QMouseEvent, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -875,6 +875,7 @@ class MainWindow(QMainWindow):
         self._apply_styles()
         self._connect_controls()
         self._update_control_states()
+        self._update_batch_list_state()
 
     def _create_interface(self) -> None:
         """Monta os painéis e controles da janela."""
@@ -920,13 +921,34 @@ class MainWindow(QMainWindow):
         content_layout.setSpacing(16)
 
         batch_layout = QVBoxLayout()
-        batch_layout.addWidget(QLabel("Imagens"))
-        self.images_list = QListWidget()
-        self.images_list.setMinimumWidth(200)
-        self.images_list.currentRowChanged.connect(self._on_batch_selection_changed)
+        batch_title_layout = QHBoxLayout()
+        batch_title_layout.addWidget(QLabel("Imagens"))
         self.batch_count_label = QLabel("0 imagens")
+        batch_title_layout.addStretch()
+        batch_title_layout.addWidget(self.batch_count_label)
+        batch_layout.addLayout(batch_title_layout)
+        self.images_list = QListWidget()
+        self.images_list.setMinimumWidth(190)
+        self.images_list.setIconSize(QSize(56, 56))
+        self.images_list.setSpacing(4)
+        self.images_list.currentRowChanged.connect(self._on_batch_selection_changed)
         batch_layout.addWidget(self.images_list, 1)
-        batch_layout.addWidget(self.batch_count_label)
+        buttons_layout = QHBoxLayout()
+        self.add_images_button = QPushButton("+ Adicionar")
+        self.remove_image_button = QPushButton("Remover")
+        self.clear_images_button = QPushButton("Limpar lista")
+        self.add_images_button.setToolTip("Adiciona mais imagens à lista.")
+        self.remove_image_button.setToolTip("Remove a imagem selecionada da lista.")
+        self.clear_images_button.setToolTip(
+            "Remove todas as imagens da lista sem apagar os arquivos originais."
+        )
+        self.add_images_button.clicked.connect(self.import_image)
+        self.remove_image_button.clicked.connect(self.remove_selected_batch_item)
+        self.clear_images_button.clicked.connect(self.clear_batch_items)
+        buttons_layout.addWidget(self.add_images_button)
+        buttons_layout.addWidget(self.remove_image_button)
+        buttons_layout.addWidget(self.clear_images_button)
+        batch_layout.addLayout(buttons_layout)
         content_layout.addLayout(batch_layout)
 
         images_layout = QHBoxLayout()
@@ -1134,6 +1156,11 @@ class MainWindow(QMainWindow):
         for action in (self.open_action, self.export_action, self.export_all_action, self.reset_action, self.exit_action): action.setShortcutContext(Qt.ShortcutContext.WindowShortcut); self.addAction(action)
         self.export_action.setEnabled(False); self.export_all_action.setEnabled(False); self.reset_action.setEnabled(False)
         self.open_action.triggered.connect(self.import_image); self.export_action.triggered.connect(self.export_png); self.export_all_action.triggered.connect(self.export_all_images); self.reset_action.triggered.connect(self.reset_application); self.exit_action.triggered.connect(self.close)
+        self.remove_selected_action = QAction("Remover imagem selecionada", self.images_list)
+        self.remove_selected_action.setShortcut(QKeySequence(Qt.Key.Key_Delete))
+        self.remove_selected_action.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
+        self.remove_selected_action.triggered.connect(self.remove_selected_batch_item)
+        self.images_list.addAction(self.remove_selected_action)
         file_menu = self.menuBar().addMenu("Arquivo")
         for action in (self.open_action, self.export_action, self.export_all_action, self.reset_action, self.exit_action): file_menu.addAction(action)
 
@@ -1190,18 +1217,128 @@ class MainWindow(QMainWindow):
             except Exception as error:
                 print(f"Erro ao adicionar {path}: {error}", file=sys.stderr)
                 continue
-            self.batch_items.append(item); self.images_list.addItem(QListWidgetItem(item.file_name))
+            list_item = QListWidgetItem(item.file_name)
+            list_item.setData(Qt.ItemDataRole.UserRole, str(path))
+            list_item.setToolTip(
+                f"{path}\n{item.width} × {item.height}\n{item.format_name}"
+            )
+            list_item.setSizeHint(QSize(0, 64))
+            icon = self._thumbnail_to_icon(item.thumbnail)
+            if icon is not None:
+                list_item.setIcon(icon)
+            self.batch_items.append(item)
+            self.images_list.addItem(list_item)
             known_paths.add(normalized); added += 1
         count = len(self.batch_items)
         self.batch_count_label.setText(f"{count} imagem" if count == 1 else f"{count} imagens")
-        self.export_all_button.setEnabled(count > 0)
-        self.export_all_action.setEnabled(count > 0)
         if was_empty and added:
             self.images_list.setCurrentRow(0)
+        self._update_batch_list_state()
 
     def _on_batch_selection_changed(self, row: int) -> None:
         if 0 <= row < len(self.batch_items):
             self.load_image_from_path(str(self.batch_items[row].file_path))
+        self._update_batch_list_state()
+
+    @staticmethod
+    def _thumbnail_to_icon(thumbnail: Image.Image | None) -> QIcon | None:
+        """Converte uma thumbnail pequena em ícone sem depender do buffer Pillow."""
+        if thumbnail is None:
+            return None
+        try:
+            image = thumbnail.convert("RGBA")
+            qimage = QImage(
+                image.tobytes("raw", "RGBA"),
+                image.width,
+                image.height,
+                image.width * 4,
+                QImage.Format.Format_RGBA8888,
+            ).copy()
+            return QIcon(QPixmap.fromImage(qimage))
+        except Exception as error:
+            print(f"Não foi possível criar thumbnail: {error}", file=sys.stderr)
+            return None
+
+    def _update_batch_list_state(self) -> None:
+        """Atualiza os controles que dependem da lista e da seleção atual."""
+        has_items = bool(self.batch_items)
+        has_selection = 0 <= self.images_list.currentRow() < len(self.batch_items)
+        is_locked = self.batch_exporting
+        self.add_images_button.setEnabled(not is_locked)
+        self.remove_image_button.setEnabled(has_selection and not is_locked)
+        self.clear_images_button.setEnabled(has_items and not is_locked)
+        self.remove_selected_action.setEnabled(has_selection and not is_locked)
+        can_export_all = has_items and not is_locked and not self._exporting
+        self.export_all_button.setEnabled(can_export_all)
+        self.export_all_action.setEnabled(can_export_all)
+
+    def _clear_loaded_image(self) -> None:
+        """Libera somente a imagem atualmente aberta, sem alterar configurações."""
+        self.original_image = None
+        self.result_image = None
+        self.original_file_path = None
+        self.original_panel.preview.set_image(None)
+        self.result_panel.preview.set_image(None)
+        self.export_button.setEnabled(False)
+        self.compare_button.setEnabled(False)
+        self.export_action.setEnabled(False)
+        self.reset_button.setEnabled(False)
+        self.reset_action.setEnabled(False)
+
+    def remove_selected_batch_item(self) -> None:
+        """Remove o item selecionado da lista, sem tocar no arquivo físico."""
+        if self.batch_exporting:
+            return
+        row = self.images_list.currentRow()
+        if not 0 <= row < len(self.batch_items):
+            return
+
+        list_item = self.images_list.item(row)
+        item_path = os.path.normcase(os.path.abspath(self.batch_items[row].file_path))
+        stored_path = os.path.normcase(os.path.abspath(list_item.data(Qt.ItemDataRole.UserRole)))
+        if item_path != stored_path:
+            return
+
+        self.processing_generation += 1
+        self._cancel_atkinson_processing()
+        self.batch_items.pop(row)
+        self.images_list.takeItem(row)
+
+        if self.batch_items:
+            self.images_list.setCurrentRow(min(row, len(self.batch_items) - 1))
+        else:
+            self._clear_loaded_image()
+        self._update_batch_count()
+        self._update_batch_list_state()
+
+    def clear_batch_items(self) -> None:
+        """Remove todos os itens apenas da aplicação, preservando os arquivos."""
+        if self.batch_exporting or not self.batch_items:
+            return
+        if len(self.batch_items) > 1:
+            answer = QMessageBox.question(
+                self,
+                "Limpar lista",
+                "Remover todas as imagens da lista?\n\n"
+                "Os arquivos originais não serão apagados.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+        self.processing_generation += 1
+        self._cancel_atkinson_processing()
+        self.batch_items.clear()
+        self.images_list.clear()
+        self._clear_loaded_image()
+        self._update_batch_count()
+        self._update_batch_list_state()
+
+    def _update_batch_count(self) -> None:
+        """Mostra a quantidade atual com singular e plural adequados."""
+        count = len(self.batch_items)
+        self.batch_count_label.setText(f"{count} imagem" if count == 1 else f"{count} imagens")
 
     def load_image_from_path(self, file_path: str) -> None:
         """Carrega a imagem usada por diálogo e arrastar/soltar."""
@@ -1522,6 +1659,7 @@ class MainWindow(QMainWindow):
         controls = (
             self.import_button, self.export_button, self.export_all_button,
             self.reset_button, self.compare_button, self.images_list,
+            self.add_images_button, self.remove_image_button, self.clear_images_button,
             self.method_combo, self.colors_spinbox, self.pixel_scale_slider,
             self.threshold_slider, self.noise_slider, self.preserve_alpha_checkbox,
             self.hard_alpha_checkbox, self.remove_background_checkbox,
@@ -1555,6 +1693,7 @@ class MainWindow(QMainWindow):
         self.remove_background_checkbox.setEnabled(True)
         self._update_background_controls()
         self._update_control_states()
+        self._update_batch_list_state()
 
     def _start_export_worker(
         self,
@@ -1782,6 +1921,7 @@ class MainWindow(QMainWindow):
         self._update_background_controls()
         del blockers
         self._update_control_states()
+        self._update_batch_list_state()
 
     def closeEvent(self, event: QCloseEvent) -> None:
         """Cancela o worker antes de destruir a janela."""
@@ -1836,6 +1976,15 @@ class MainWindow(QMainWindow):
             }
             QComboBox::drop-down { border: none; width: 24px; }
             QCheckBox { spacing: 8px; padding: 3px 0; }
+            QListWidget {
+                background-color: #202124;
+                border: 1px solid #50535a;
+                border-radius: 4px;
+                padding: 3px;
+            }
+            QListWidget::item { border-radius: 4px; padding: 4px; }
+            QListWidget::item:hover { background-color: #30343a; }
+            QListWidget::item:selected { background-color: #3a6ea5; color: white; }
             """
         )
 
