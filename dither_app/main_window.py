@@ -21,6 +21,8 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -32,6 +34,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from dither_app.resources import app_icon_path
+from dither_app.batch import BatchImageItem, is_supported_image_path, make_batch_item
 
 
 @dataclass(frozen=True)
@@ -709,6 +712,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.original_image: Image.Image | None = None
+        self.batch_items: list[BatchImageItem] = []
         self.result_image: Image.Image | None = None
         self.original_file_path: str | None = None
         self.eyedropper_active = False
@@ -767,7 +771,7 @@ class MainWindow(QMainWindow):
         toolbar_layout = QHBoxLayout()
         toolbar_layout.setSpacing(10)
 
-        self.import_button = QPushButton("Importar imagem")
+        self.import_button = QPushButton("Importar imagens")
         self.export_button = QPushButton("Exportar PNG")
         self.reset_button = QPushButton("Redefinir")
         self.compare_button = QPushButton("Segure para comparar")
@@ -789,6 +793,16 @@ class MainWindow(QMainWindow):
 
         content_layout = QHBoxLayout()
         content_layout.setSpacing(16)
+
+        batch_layout = QVBoxLayout()
+        batch_layout.addWidget(QLabel("Imagens"))
+        self.images_list = QListWidget()
+        self.images_list.setMinimumWidth(200)
+        self.images_list.currentRowChanged.connect(self._on_batch_selection_changed)
+        self.batch_count_label = QLabel("0 imagens")
+        batch_layout.addWidget(self.images_list, 1)
+        batch_layout.addWidget(self.batch_count_label)
+        content_layout.addLayout(batch_layout)
 
         images_layout = QHBoxLayout()
         images_layout.setSpacing(16)
@@ -1003,37 +1017,61 @@ class MainWindow(QMainWindow):
     def _restore_result_after_comparison(self) -> None:
         self.result_panel.preview.set_image(self.result_image or self.original_image)
 
-    def _get_first_supported_dropped_file(self, mime_data: object) -> str | None:
-        if not mime_data.hasUrls(): return None
-        for url in mime_data.urls():
-            path = url.toLocalFile()
-            if path and Path(path).suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}: return path
-        return None
+    def _get_supported_dropped_files(self, mime_data: object) -> list[str]:
+        """Extrai todos os arquivos de imagem compatíveis de um drop."""
+        if not mime_data.hasUrls(): return []
+        return [url.toLocalFile() for url in mime_data.urls()
+                if url.isLocalFile() and is_supported_image_path(Path(url.toLocalFile()))]
 
     def dragEnterEvent(self, event: object) -> None:
-        if self._get_first_supported_dropped_file(event.mimeData()): event.setDropAction(Qt.DropAction.CopyAction); event.accept()
+        if self._get_supported_dropped_files(event.mimeData()): event.setDropAction(Qt.DropAction.CopyAction); event.accept()
         else: event.ignore()
 
     def dragMoveEvent(self, event: object) -> None:
         self.dragEnterEvent(event)
 
     def dropEvent(self, event: object) -> None:
-        path = self._get_first_supported_dropped_file(event.mimeData())
-        if path: self.load_image_from_path(path); event.acceptProposedAction()
+        paths = self._get_supported_dropped_files(event.mimeData())
+        if paths: self.add_images_from_paths(paths); event.acceptProposedAction()
         else: event.ignore()
 
     def import_image(self) -> None:
         """Abre uma imagem e a mostra nos dois painéis."""
-        file_path, _ = QFileDialog.getOpenFileName(
+        file_paths, _ = QFileDialog.getOpenFileNames(
             self,
             "Selecionar imagem",
             "",
             "Imagens (*.png *.jpg *.jpeg *.webp *.bmp)",
         )
-        if not file_path:
+        if not file_paths:
             return
+        self.add_images_from_paths(file_paths)
 
-        self.load_image_from_path(file_path)
+    def add_images_from_paths(self, file_paths: object) -> None:
+        """Adiciona todos os caminhos válidos sem carregar todos os originais."""
+        was_empty = not self.batch_items
+        known_paths = {os.path.normcase(os.path.abspath(item.file_path)) for item in self.batch_items}
+        added = 0
+        for file_path in file_paths:
+            path = Path(file_path).expanduser().resolve()
+            normalized = os.path.normcase(os.path.abspath(path))
+            if not path.is_file() or not is_supported_image_path(path) or normalized in known_paths:
+                continue
+            try:
+                item = make_batch_item(path)
+            except Exception as error:
+                print(f"Erro ao adicionar {path}: {error}", file=sys.stderr)
+                continue
+            self.batch_items.append(item); self.images_list.addItem(QListWidgetItem(item.file_name))
+            known_paths.add(normalized); added += 1
+        count = len(self.batch_items)
+        self.batch_count_label.setText(f"{count} imagem" if count == 1 else f"{count} imagens")
+        if was_empty and added:
+            self.images_list.setCurrentRow(0)
+
+    def _on_batch_selection_changed(self, row: int) -> None:
+        if 0 <= row < len(self.batch_items):
+            self.load_image_from_path(str(self.batch_items[row].file_path))
 
     def load_image_from_path(self, file_path: str) -> None:
         """Carrega a imagem usada por diálogo e arrastar/soltar."""
