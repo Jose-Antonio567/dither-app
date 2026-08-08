@@ -11,13 +11,13 @@ if (Test-Path build\onefile) { Remove-Item -Recurse -Force build\onefile }
 if (Test-Path dist\DitherApp.exe) { Remove-Item -Force dist\DitherApp.exe }
 python -m PyInstaller --noconfirm --clean DitherApp-OneFile.spec
 if (-not (Test-Path dist\DitherApp.exe)) { throw 'Executável onefile não foi criado.' }
-$releaseName = 'DitherApp-0.9.0-beta-win64'
+$releaseName = 'DitherApp-0.10.0-beta-win64'
 $releaseRoot = Join-Path 'release' $releaseName
 if (Test-Path $releaseRoot) { Remove-Item -Recurse -Force $releaseRoot }
 New-Item -ItemType Directory -Force $releaseRoot | Out-Null
 Copy-Item dist\DitherApp.exe $releaseRoot
 @"
-Dither App 0.9.0 Beta
+Dither App 0.10.0 Beta
 Desenvolvido por Tiny Glitch
 
 Aplicativo dedicado à aplicação de efeitos de dithering em imagens.

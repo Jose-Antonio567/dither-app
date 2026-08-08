@@ -1,6 +1,6 @@
 #define MyAppName "Dither App"
-#define MyAppVersion "0.9.0"
-#define MyAppVersionLabel "0.9.0 Beta"
+#define MyAppVersion "0.10.0"
+#define MyAppVersionLabel "0.10.0 Beta"
 #define MyAppPublisher "Tiny Glitch"
 #define MyAppExeName "DitherApp.exe"
 
@@ -21,8 +21,8 @@ UninstallDisplayIcon={app}\DitherApp.exe
 Compression=lzma2
 SolidCompression=yes
 OutputDir=..\release\installer
-OutputBaseFilename=DitherApp-Setup-0.9.0-beta-win64
-VersionInfoVersion=0.9.0.0
+OutputBaseFilename=DitherApp-Setup-0.10.0-beta-win64
+VersionInfoVersion=0.10.0.0
 VersionInfoCompany=Tiny Glitch
 VersionInfoProductName=Dither App
 VersionInfoDescription=Instalador do Dither App

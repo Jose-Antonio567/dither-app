@@ -1,7 +1,7 @@
 """Identidade e versão pública do aplicativo."""
 
 APP_NAME = "Dither App"
-APP_VERSION = "0.9.0"
-APP_VERSION_LABEL = "0.9.0 Beta"
+APP_VERSION = "0.10.0"
+APP_VERSION_LABEL = "0.10.0 Beta"
 ORGANIZATION_NAME = "Tiny Glitch"
 EXECUTABLE_NAME = "DitherApp"
