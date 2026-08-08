@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageOps, UnidentifiedImageError
-from PySide6.QtCore import QObject, QRect, QSignalBlocker, QThread, QTimer, Qt, Signal, Slot
+from PySide6.QtCore import QObject, QRect, QSettings, QSignalBlocker, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QAction, QCloseEvent, QColor, QIcon, QImage, QKeySequence, QMouseEvent, QPainter
 from PySide6.QtWidgets import (
     QApplication,
@@ -34,7 +34,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from dither_app.resources import app_icon_path
-from dither_app.batch import BatchImageItem, is_supported_image_path, make_batch_item
+from dither_app.batch import (
+    BatchImageItem,
+    available_output_path,
+    is_supported_image_path,
+    make_batch_item,
+)
 
 
 @dataclass(frozen=True)
@@ -586,6 +591,113 @@ class ImageProcessingWorker(QObject):
                 temporary_path.unlink()
 
 
+class BatchExportWorker(QObject):
+    """Exporta uma lista de imagens sem acessar componentes da interface."""
+
+    progress = Signal(int, int, str)
+    file_completed = Signal(str, str)
+    file_failed = Signal(str, str)
+    completed = Signal(int, int)
+    cancelled = Signal()
+    error = Signal(str, str)
+
+    def __init__(
+        self,
+        file_paths: tuple[Path, ...],
+        settings: ProcessingSettings,
+        output_directory: Path,
+        task_id: int,
+    ) -> None:
+        super().__init__()
+        self._file_paths = file_paths
+        self._settings = settings
+        self._output_directory = output_directory
+        self._task_id = task_id
+        self._cancel_event = threading.Event()
+
+    def request_cancel(self) -> None:
+        """Solicita o cancelamento entre arquivos ou durante o processamento."""
+        self._cancel_event.set()
+
+    @Slot()
+    def run(self) -> None:
+        """Processa todos os arquivos, mantendo as falhas isoladas."""
+        success_count = 0
+        failure_count = 0
+        total = len(self._file_paths)
+        try:
+            for index, file_path in enumerate(self._file_paths, start=1):
+                if self._cancel_event.is_set():
+                    self.cancelled.emit()
+                    return
+
+                self.progress.emit(index, total, file_path.name)
+                output_path: Path | None = None
+                try:
+                    with Image.open(file_path) as source_image:
+                        image = ImageOps.exif_transpose(source_image).convert("RGBA")
+                    result = process_image_with_settings(
+                        image, self._settings, self._cancel_event.is_set
+                    )
+                    if self._cancel_event.is_set():
+                        self.cancelled.emit()
+                        return
+                    output_path = self._reserve_output_path(file_path)
+                    self._save_png(result, output_path, index)
+                    success_count += 1
+                    self.file_completed.emit(str(file_path), str(output_path))
+                except ProcessingCancelled:
+                    if output_path is not None and output_path.exists():
+                        output_path.unlink()
+                    self.cancelled.emit()
+                    return
+                except Exception:
+                    if output_path is not None and output_path.exists():
+                        output_path.unlink()
+                    details = traceback.format_exc()
+                    print(
+                        f"Erro ao exportar em lote {file_path}:\n{details}",
+                        file=sys.stderr,
+                    )
+                    failure_count += 1
+                    self.file_failed.emit(str(file_path), details)
+        except Exception:
+            details = traceback.format_exc()
+            self.error.emit("Erro inesperado na exportação em lote.", details)
+        else:
+            self.completed.emit(success_count, failure_count)
+
+    def _save_png(self, image: Image.Image, output_path: Path, index: int) -> None:
+        """Grava em arquivo temporário antes de publicar o PNG final."""
+        temporary_path = output_path.with_name(
+            f".{output_path.stem}.{self._task_id}.{index}.tmp.png"
+        )
+        try:
+            image.convert("RGBA").save(
+                temporary_path, format="PNG", optimize=False, compress_level=6
+            )
+            if self._cancel_event.is_set():
+                raise ProcessingCancelled()
+            os.replace(temporary_path, output_path)
+        finally:
+            if temporary_path.exists():
+                temporary_path.unlink()
+
+    def _reserve_output_path(self, source_path: Path) -> Path:
+        """Reserva um nome livre para impedir que arquivos existentes sejam sobrescritos."""
+        while True:
+            output_path = available_output_path(self._output_directory, source_path)
+            try:
+                descriptor = os.open(
+                    output_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY
+                )
+            except FileExistsError:
+                continue
+            else:
+                os.close(descriptor)
+                return output_path
+
+
 class ImagePreviewWidget(QWidget):
     """Mostra uma imagem sobre um fundo quadriculado de transparência."""
 
@@ -717,6 +829,7 @@ class MainWindow(QMainWindow):
         self.original_file_path: str | None = None
         self.eyedropper_active = False
         self.background_color = (255, 255, 255)
+        self.settings = QSettings()
         self.processing_generation = 0
         self.atkinson_thread: QThread | None = None
         self.atkinson_worker: ImageProcessingWorker | None = None
@@ -729,6 +842,10 @@ class MainWindow(QMainWindow):
         self._exporting = False
         self.export_generation = 0
         self._active_export_path: Path | None = None
+        self.batch_thread: QThread | None = None
+        self.batch_worker: BatchExportWorker | None = None
+        self.batch_exporting = False
+        self.batch_task_id = 0
         self._is_closing = False
         self.noise_debounce_timer = QTimer(self)
         self.noise_debounce_timer.setSingleShot(True)
@@ -772,20 +889,28 @@ class MainWindow(QMainWindow):
         toolbar_layout.setSpacing(10)
 
         self.import_button = QPushButton("Importar imagens")
-        self.export_button = QPushButton("Exportar PNG")
+        self.export_button = QPushButton("Exportar atual")
+        self.export_all_button = QPushButton("Exportar todas")
         self.reset_button = QPushButton("Redefinir")
         self.compare_button = QPushButton("Segure para comparar")
+        self.export_all_button.setToolTip(
+            "Processa e exporta todas as imagens da lista usando as configurações atuais."
+        )
+        self.export_all_button.setAccessibleName("Exportar todas as imagens")
         self.export_button.setEnabled(False)
+        self.export_all_button.setEnabled(False)
         self.reset_button.setEnabled(False)
         self.compare_button.setEnabled(False)
         self.import_button.clicked.connect(self.import_image)
         self.export_button.clicked.connect(self.export_png)
+        self.export_all_button.clicked.connect(self.export_all_images)
         self.reset_button.clicked.connect(self.reset_application)
         self.compare_button.pressed.connect(self._show_original_for_comparison)
         self.compare_button.released.connect(self._restore_result_after_comparison)
 
         toolbar_layout.addWidget(self.import_button)
         toolbar_layout.addWidget(self.export_button)
+        toolbar_layout.addWidget(self.export_all_button)
         toolbar_layout.addWidget(self.reset_button)
         toolbar_layout.addWidget(self.compare_button)
         toolbar_layout.addStretch()
@@ -1001,15 +1126,16 @@ class MainWindow(QMainWindow):
 
     def _create_actions(self) -> None:
         """Cria ações de menu e atalhos globais."""
-        self.open_action = QAction("Abrir imagem...", self); self.open_action.setShortcut(QKeySequence.StandardKey.Open)
-        self.export_action = QAction("Exportar PNG...", self); self.export_action.setShortcut(QKeySequence("Ctrl+Shift+S"))
+        self.open_action = QAction("Abrir imagens...", self); self.open_action.setShortcut(QKeySequence.StandardKey.Open)
+        self.export_action = QAction("Exportar atual...", self); self.export_action.setShortcut(QKeySequence("Ctrl+Shift+S"))
+        self.export_all_action = QAction("Exportar todas...", self); self.export_all_action.setShortcut(QKeySequence("Ctrl+Alt+Shift+S"))
         self.reset_action = QAction("Redefinir", self); self.reset_action.setShortcut(QKeySequence("Ctrl+R"))
         self.exit_action = QAction("Sair", self); self.exit_action.setShortcut(QKeySequence("Ctrl+Q"))
-        for action in (self.open_action, self.export_action, self.reset_action, self.exit_action): action.setShortcutContext(Qt.ShortcutContext.WindowShortcut); self.addAction(action)
-        self.export_action.setEnabled(False); self.reset_action.setEnabled(False)
-        self.open_action.triggered.connect(self.import_image); self.export_action.triggered.connect(self.export_png); self.reset_action.triggered.connect(self.reset_application); self.exit_action.triggered.connect(self.close)
+        for action in (self.open_action, self.export_action, self.export_all_action, self.reset_action, self.exit_action): action.setShortcutContext(Qt.ShortcutContext.WindowShortcut); self.addAction(action)
+        self.export_action.setEnabled(False); self.export_all_action.setEnabled(False); self.reset_action.setEnabled(False)
+        self.open_action.triggered.connect(self.import_image); self.export_action.triggered.connect(self.export_png); self.export_all_action.triggered.connect(self.export_all_images); self.reset_action.triggered.connect(self.reset_application); self.exit_action.triggered.connect(self.close)
         file_menu = self.menuBar().addMenu("Arquivo")
-        for action in (self.open_action, self.export_action, self.reset_action, self.exit_action): file_menu.addAction(action)
+        for action in (self.open_action, self.export_action, self.export_all_action, self.reset_action, self.exit_action): file_menu.addAction(action)
 
     def _show_original_for_comparison(self) -> None:
         if self.original_image is not None: self.result_panel.preview.set_image(self.original_image)
@@ -1048,7 +1174,9 @@ class MainWindow(QMainWindow):
         self.add_images_from_paths(file_paths)
 
     def add_images_from_paths(self, file_paths: object) -> None:
-        """Adiciona todos os caminhos válidos sem carregar todos os originais."""
+        """Adiciona todos os caminhos válidos sem carregar os originais completos."""
+        if self.batch_exporting:
+            return
         was_empty = not self.batch_items
         known_paths = {os.path.normcase(os.path.abspath(item.file_path)) for item in self.batch_items}
         added = 0
@@ -1066,6 +1194,8 @@ class MainWindow(QMainWindow):
             known_paths.add(normalized); added += 1
         count = len(self.batch_items)
         self.batch_count_label.setText(f"{count} imagem" if count == 1 else f"{count} imagens")
+        self.export_all_button.setEnabled(count > 0)
+        self.export_all_action.setEnabled(count > 0)
         if was_empty and added:
             self.images_list.setCurrentRow(0)
 
@@ -1279,6 +1409,153 @@ class MainWindow(QMainWindow):
             self._pending_export_request = None
             self._start_export_worker(request)
 
+    def export_all_images(self) -> None:
+        """Exporta cada item da lista usando uma única captura das configurações."""
+        if not self.batch_items or self.batch_exporting or self._exporting:
+            return
+
+        saved_directory = self.settings.value("paths/last_export_directory", "", str)
+        initial_directory = (
+            saved_directory
+            if saved_directory and Path(saved_directory).is_dir()
+            else str(self.batch_items[0].file_path.parent)
+        )
+        directory_name = QFileDialog.getExistingDirectory(
+            self, "Selecionar pasta para exportar todas", initial_directory
+        )
+        if not directory_name:
+            return
+        self.settings.setValue("paths/last_export_directory", directory_name)
+
+        self.batch_task_id += 1
+        settings = self._current_settings()
+        file_paths = tuple(item.file_path for item in self.batch_items)
+        self._cancel_atkinson_processing()
+        self._start_batch_export_worker(
+            file_paths, settings, Path(directory_name), self.batch_task_id
+        )
+
+    def _start_batch_export_worker(
+        self,
+        file_paths: tuple[Path, ...],
+        settings: ProcessingSettings,
+        output_directory: Path,
+        task_id: int,
+    ) -> None:
+        """Inicia a exportação em lote sem bloquear a interface."""
+        self.batch_exporting = True
+        self._set_batch_export_state(True)
+        self.progress_bar.setRange(0, len(file_paths))
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
+        self.statusBar().showMessage("Preparando exportação em lote...")
+
+        thread = QThread(self)
+        worker = BatchExportWorker(file_paths, settings, output_directory, task_id)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_batch_export_progress)
+        worker.file_completed.connect(self._on_batch_file_completed)
+        worker.file_failed.connect(self._on_batch_file_failed)
+        worker.completed.connect(self._on_batch_export_completed)
+        worker.cancelled.connect(self._on_batch_export_cancelled)
+        worker.error.connect(self._on_batch_export_failed)
+        worker.completed.connect(thread.quit, Qt.ConnectionType.DirectConnection)
+        worker.cancelled.connect(thread.quit, Qt.ConnectionType.DirectConnection)
+        worker.error.connect(thread.quit, Qt.ConnectionType.DirectConnection)
+        worker.completed.connect(worker.deleteLater)
+        worker.cancelled.connect(worker.deleteLater)
+        worker.error.connect(worker.deleteLater)
+        thread.finished.connect(self._on_batch_export_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        self.batch_thread = thread
+        self.batch_worker = worker
+        thread.start()
+
+    def _on_batch_export_progress(self, current: int, total: int, file_name: str) -> None:
+        self.progress_bar.setRange(0, total)
+        self.progress_bar.setValue(current)
+        self.statusBar().showMessage(f"Processando {current} de {total} — {file_name}")
+
+    def _on_batch_file_completed(self, source_path: str, output_path: str) -> None:
+        del source_path, output_path
+
+    def _on_batch_file_failed(self, file_path: str, error_details: str) -> None:
+        print(f"Falha na exportação em lote de {file_path}:\n{error_details}", file=sys.stderr)
+
+    def _on_batch_export_completed(self, success_count: int, failure_count: int) -> None:
+        if failure_count == 0:
+            message = f"{success_count} imagens exportadas com sucesso."
+        else:
+            message = f"{success_count} imagens exportadas — {failure_count} falhou."
+        self.statusBar().showMessage(message, 7000)
+        if failure_count:
+            QMessageBox.warning(
+                self,
+                "Algumas imagens não puderam ser exportadas.",
+                f"Total: {success_count + failure_count}\n"
+                f"Sucesso: {success_count}\nFalhas: {failure_count}",
+            )
+
+    def _on_batch_export_cancelled(self) -> None:
+        self.statusBar().showMessage("Exportação em lote cancelada.", 5000)
+
+    def _on_batch_export_failed(self, message: str, error_details: str) -> None:
+        print(f"Erro na exportação em lote:\n{error_details}", file=sys.stderr)
+        QMessageBox.critical(
+            self,
+            "Erro na exportação em lote",
+            message,
+        )
+
+    def _on_batch_export_thread_finished(self) -> None:
+        if self.sender() is not self.batch_thread:
+            return
+        self.batch_thread = None
+        self.batch_worker = None
+        self.batch_exporting = False
+        self.progress_bar.setVisible(False)
+        self._set_batch_export_state(False)
+
+    def _set_batch_export_state(self, is_exporting: bool) -> None:
+        """Evita alterações na lista e nas configurações durante o lote."""
+        controls = (
+            self.import_button, self.export_button, self.export_all_button,
+            self.reset_button, self.compare_button, self.images_list,
+            self.method_combo, self.colors_spinbox, self.pixel_scale_slider,
+            self.threshold_slider, self.noise_slider, self.preserve_alpha_checkbox,
+            self.hard_alpha_checkbox, self.remove_background_checkbox,
+            self.background_color_button, self.background_tolerance_slider,
+            self.background_connected_checkbox,
+        )
+        if is_exporting:
+            for control in controls:
+                control.setEnabled(False)
+            self.open_action.setEnabled(False)
+            self.export_action.setEnabled(False)
+            self.export_all_action.setEnabled(False)
+            self.reset_action.setEnabled(False)
+            return
+
+        has_current_image = self.original_image is not None
+        has_batch_items = bool(self.batch_items)
+        self.import_button.setEnabled(True)
+        self.export_button.setEnabled(has_current_image)
+        self.export_all_button.setEnabled(has_batch_items)
+        self.reset_button.setEnabled(has_current_image)
+        self.compare_button.setEnabled(has_current_image)
+        self.images_list.setEnabled(True)
+        self.open_action.setEnabled(True)
+        self.export_action.setEnabled(has_current_image)
+        self.export_all_action.setEnabled(has_batch_items)
+        self.reset_action.setEnabled(has_current_image)
+        self.method_combo.setEnabled(True)
+        self.preserve_alpha_checkbox.setEnabled(True)
+        self.hard_alpha_checkbox.setEnabled(True)
+        self.remove_background_checkbox.setEnabled(True)
+        self._update_background_controls()
+        self._update_control_states()
+
     def _start_export_worker(
         self,
         request: tuple[int, Image.Image, ProcessingSettings, Path] | None,
@@ -1404,7 +1681,8 @@ class MainWindow(QMainWindow):
             return
 
         self._set_atkinson_processing_state(False)
-        self._hide_processing()
+        if not self.batch_exporting:
+            self._hide_processing()
         if self._active_task_type == "export":
             self._set_export_state(False)
             self._active_task_type = "preview"
@@ -1414,6 +1692,8 @@ class MainWindow(QMainWindow):
             self._atkinson_processing = False
 
     def _set_atkinson_processing_state(self, is_processing: bool) -> None:
+        if self.batch_exporting:
+            return
         """Mantém apenas os botões de arquivo indisponíveis durante o trabalho."""
         self.import_button.setEnabled(not is_processing)
         self.reset_button.setEnabled(not is_processing and self.original_image is not None)
@@ -1462,12 +1742,17 @@ class MainWindow(QMainWindow):
         self.original_image = None
         self.result_image = None
         self.original_file_path = None
+        self.batch_items.clear()
+        self.images_list.clear()
+        self.batch_count_label.setText("0 imagens")
         self.original_panel.preview.set_image(None)
         self.result_panel.preview.set_image(None)
         self.reset_button.setEnabled(False)
         self.export_button.setEnabled(False)
+        self.export_all_button.setEnabled(False)
         self.compare_button.setEnabled(False)
         self.export_action.setEnabled(False)
+        self.export_all_action.setEnabled(False)
         self.reset_action.setEnabled(False)
 
         controls = (
@@ -1503,8 +1788,12 @@ class MainWindow(QMainWindow):
         self._is_closing = True
         self.noise_debounce_timer.stop()
         self._cancel_atkinson_processing()
+        if self.batch_worker is not None:
+            self.batch_worker.request_cancel()
         if self.atkinson_thread is not None and self.atkinson_thread.isRunning():
             self.atkinson_thread.wait()
+        if self.batch_thread is not None and self.batch_thread.isRunning():
+            self.batch_thread.wait()
         if self._atkinson_processing:
             QApplication.restoreOverrideCursor()
             self._atkinson_processing = False
