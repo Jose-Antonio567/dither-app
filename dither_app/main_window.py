@@ -5,7 +5,6 @@ import threading
 import traceback
 from collections.abc import Callable
 from collections import deque
-from dataclasses import dataclass
 import os
 from pathlib import Path
 
@@ -24,6 +23,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QInputDialog,
     QMessageBox,
     QPushButton,
     QProgressBar,
@@ -34,30 +34,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from dither_app.resources import app_icon_path
+from dither_app.settings import ProcessingSettings, get_default_processing_settings
+from dither_app.presets import NORMAL_PRESET_NAME, PresetManager, UserPreset
 from dither_app.batch import (
     BatchImageItem,
     available_output_path,
     is_supported_image_path,
     make_batch_item,
 )
-
-
-@dataclass(frozen=True)
-class ProcessingSettings:
-    """Configurações capturadas para uma prévia ou exportação."""
-
-    method: str
-    color_count: int
-    threshold: int
-    noise_intensity: int
-    preserve_transparency: bool
-    hard_alpha: bool
-    noise_seed: int = 12345
-    remove_background: bool = False
-    background_color: tuple[int, int, int] = (255, 255, 255)
-    background_tolerance: int = 30
-    background_connected_only: bool = True
-    pixel_scale: int = 1
 
 
 def downscale_for_pixel_scale(image: Image.Image, pixel_scale: int) -> Image.Image:
@@ -830,6 +814,9 @@ class MainWindow(QMainWindow):
         self.eyedropper_active = False
         self.background_color = (255, 255, 255)
         self.settings = QSettings()
+        self.preset_manager = PresetManager()
+        self.user_presets = self.preset_manager.load()
+        self.preset_dirty = False
         self.processing_generation = 0
         self.atkinson_thread: QThread | None = None
         self.atkinson_worker: ImageProcessingWorker | None = None
@@ -872,8 +859,11 @@ class MainWindow(QMainWindow):
         self.progress_bar.setRange(0, 0)
         self.progress_bar.setVisible(False)
         self.statusBar().addPermanentWidget(self.progress_bar)
+        if self.preset_manager.load_error:
+            self.statusBar().showMessage("Não foi possível carregar algumas predefinições.", 6000)
         self._apply_styles()
         self._connect_controls()
+        self.apply_processing_settings_to_ui(get_default_processing_settings())
         self._update_control_states()
         self._update_batch_list_state()
 
@@ -977,6 +967,25 @@ class MainWindow(QMainWindow):
         title_label.setObjectName("settingsTitle")
         layout.addWidget(title_label)
 
+        layout.addWidget(QLabel("Predefinição"))
+        self.preset_combo = QComboBox()
+        self.preset_dirty_label = QLabel("")
+        self.save_preset_button = QPushButton("Salvar como...")
+        self.update_preset_button = QPushButton("Atualizar")
+        self.delete_preset_button = QPushButton("Excluir")
+        self.save_preset_button.setToolTip("Salva as configurações atuais como uma nova predefinição.")
+        self.update_preset_button.setToolTip("Substitui a predefinição selecionada pelas configurações atuais.")
+        self.delete_preset_button.setToolTip("Exclui a predefinição selecionada.")
+        self.save_preset_button.setAccessibleName("Salvar predefinição")
+        self.update_preset_button.setAccessibleName("Atualizar predefinição")
+        self.delete_preset_button.setAccessibleName("Excluir predefinição")
+        layout.addWidget(self.preset_combo)
+        preset_buttons = QHBoxLayout()
+        for button in (self.save_preset_button, self.update_preset_button, self.delete_preset_button): preset_buttons.addWidget(button)
+        layout.addLayout(preset_buttons)
+        layout.addWidget(self.preset_dirty_label)
+        self._refresh_preset_combo()
+
         layout.addWidget(QLabel("Método de dithering"))
         self.method_combo = QComboBox()
         self.method_combo.addItems(
@@ -1048,7 +1057,117 @@ class MainWindow(QMainWindow):
         self.background_tolerance_slider.valueChanged.connect(self._on_background_tolerance_changed)
         self.background_connected_checkbox.toggled.connect(self._on_background_changed)
         self.background_debounce_timer.timeout.connect(self.update_result)
+        self.preset_combo.currentIndexChanged.connect(self._on_preset_selected)
+        self.save_preset_button.clicked.connect(self.save_preset_as)
+        self.update_preset_button.clicked.connect(self.update_selected_preset)
+        self.delete_preset_button.clicked.connect(self.delete_selected_preset)
+        for control in (self.method_combo, self.colors_spinbox, self.pixel_scale_slider,
+                        self.threshold_slider, self.noise_slider, self.preserve_alpha_checkbox,
+                        self.hard_alpha_checkbox, self.remove_background_checkbox,
+                        self.background_tolerance_slider, self.background_connected_checkbox):
+            if hasattr(control, "valueChanged"): control.valueChanged.connect(self._refresh_preset_dirty)
+            elif hasattr(control, "toggled"): control.toggled.connect(self._refresh_preset_dirty)
+            else: control.currentTextChanged.connect(self._refresh_preset_dirty)
         self._update_background_swatch(); self._update_background_controls()
+
+    def _refresh_preset_combo(self) -> None:
+        """Reconstrói Normal e os presets do usuário em ordem alfabética."""
+        current_name = self.preset_combo.currentData() if self.preset_combo.count() else NORMAL_PRESET_NAME
+        blocker = QSignalBlocker(self.preset_combo)
+        self.preset_combo.clear()
+        self.preset_combo.addItem(NORMAL_PRESET_NAME, NORMAL_PRESET_NAME)
+        for preset in sorted(self.user_presets, key=lambda item: item.name.casefold()):
+            self.preset_combo.addItem(preset.name, preset.name)
+        index = self.preset_combo.findData(current_name)
+        self.preset_combo.setCurrentIndex(max(0, index))
+        del blocker
+        self._update_preset_buttons()
+
+    def _selected_preset(self) -> UserPreset | None:
+        name = self.preset_combo.currentData()
+        return next((preset for preset in self.user_presets if preset.name == name), None)
+
+    def _on_preset_selected(self, index: int = 0) -> None:
+        del index
+        preset = self._selected_preset()
+        self.apply_processing_settings_to_ui(
+            preset.settings if preset is not None else get_default_processing_settings()
+        )
+
+    def apply_processing_settings_to_ui(self, settings: ProcessingSettings) -> None:
+        """Aplica um preset bloqueando sinais para gerar apenas uma prévia."""
+        self.noise_debounce_timer.stop(); self.pixel_scale_debounce_timer.stop(); self.background_debounce_timer.stop()
+        controls = (self.method_combo, self.colors_spinbox, self.pixel_scale_slider,
+                    self.threshold_slider, self.noise_slider, self.preserve_alpha_checkbox,
+                    self.hard_alpha_checkbox, self.remove_background_checkbox,
+                    self.background_tolerance_slider, self.background_connected_checkbox)
+        blockers = [QSignalBlocker(control) for control in controls]
+        self.method_combo.setCurrentText(settings.method)
+        self.colors_spinbox.setValue(settings.color_count); self.pixel_scale_slider.setValue(settings.pixel_scale)
+        self.threshold_slider.setValue(settings.threshold); self.noise_slider.setValue(settings.noise_intensity)
+        self.preserve_alpha_checkbox.setChecked(settings.preserve_transparency); self.hard_alpha_checkbox.setChecked(settings.hard_alpha)
+        self.remove_background_checkbox.setChecked(settings.remove_background); self.background_color = settings.background_color
+        self.background_tolerance_slider.setValue(settings.background_tolerance)
+        self.background_connected_checkbox.setChecked(settings.background_connected_only)
+        self.pixel_scale_label.setText(f"Pixel Scale: {settings.pixel_scale}x")
+        self.threshold_label.setText(f"Limiar: {settings.threshold}")
+        self.noise_label.setText(f"Intensidade do ruído: {settings.noise_intensity}%")
+        self.background_tolerance_label.setText(f"Tolerância: {settings.background_tolerance}")
+        del blockers
+        self._update_background_swatch(); self._update_background_controls(); self._update_control_states()
+        self.preset_dirty = False; self.preset_dirty_label.setText(""); self._update_preset_buttons()
+        self.update_result()
+
+    def _refresh_preset_dirty(self, *args: object) -> None:
+        del args
+        selected = self._selected_preset()
+        reference = selected.settings if selected is not None else get_default_processing_settings()
+        self.preset_dirty = self._current_settings() != reference
+        self.preset_dirty_label.setText("Modificado" if self.preset_dirty else "")
+
+    def _update_preset_buttons(self) -> None:
+        locked = self.batch_exporting or self._exporting
+        user_preset_selected = self._selected_preset() is not None
+        self.save_preset_button.setEnabled(not locked)
+        self.update_preset_button.setEnabled(user_preset_selected and not locked)
+        self.delete_preset_button.setEnabled(user_preset_selected and not locked)
+
+    def save_preset_as(self) -> None:
+        name, accepted = QInputDialog.getText(self, "Salvar predefinição", "Nome da predefinição:")
+        if not accepted:
+            return
+        try:
+            from dither_app.presets import validate_preset_name
+            name = validate_preset_name(name)
+        except ValueError:
+            QMessageBox.warning(self, "Predefinição inválida", "Informe um nome válido diferente de Normal.")
+            return
+        existing = next((preset for preset in self.user_presets if preset.name.casefold() == name.casefold()), None)
+        if existing is not None and QMessageBox.question(self, "Predefinição existente", "Já existe uma predefinição com esse nome.\nDeseja substituí-la?") != QMessageBox.StandardButton.Yes:
+            return
+        if existing is not None: self.user_presets.remove(existing)
+        self.user_presets.append(UserPreset(name, self._current_settings()))
+        self.preset_manager.save(self.user_presets); self._refresh_preset_combo()
+        self.preset_combo.setCurrentIndex(self.preset_combo.findData(name)); self.preset_dirty = False
+        self.statusBar().showMessage(f"Predefinição '{name}' salva.", 4000)
+
+    def update_selected_preset(self) -> None:
+        preset = self._selected_preset()
+        if preset is None:
+            return
+        if QMessageBox.question(self, "Atualizar predefinição", f"Atualizar a predefinição '{preset.name}' com as configurações atuais?") != QMessageBox.StandardButton.Yes: return
+        self.user_presets[self.user_presets.index(preset)] = UserPreset(preset.name, self._current_settings())
+        self.preset_manager.save(self.user_presets); self.preset_dirty = False; self._update_preset_buttons()
+        self.statusBar().showMessage(f"Predefinição '{preset.name}' atualizada.", 4000)
+
+    def delete_selected_preset(self) -> None:
+        preset = self._selected_preset()
+        if preset is None:
+            return
+        if QMessageBox.question(self, "Excluir predefinição", f"Excluir a predefinição '{preset.name}'?\n\nEsta ação não altera imagens ou arquivos exportados.") != QMessageBox.StandardButton.Yes: return
+        self.user_presets.remove(preset); self.preset_manager.save(self.user_presets); self._refresh_preset_combo()
+        self.preset_combo.setCurrentIndex(0); self._on_preset_selected()
+        self.statusBar().showMessage(f"Predefinição '{preset.name}' excluída.", 4000)
 
     def _on_method_changed(self, method: str) -> None:
         """Atualiza o estado dos controles ao trocar de método."""
@@ -1110,7 +1229,7 @@ class MainWindow(QMainWindow):
     def _pick_background_color(self, x_position: int, y_position: int) -> None:
         if not self.eyedropper_active or self.original_image is None: return
         self.background_color = tuple(self.original_image.getpixel((x_position, y_position))[:3])
-        self.eyedropper_active = False; self.original_panel.preview.unsetCursor(); self._update_background_swatch(); self.update_result()
+        self.eyedropper_active = False; self.original_panel.preview.unsetCursor(); self._update_background_swatch(); self.update_result(); self._refresh_preset_dirty()
 
     def _apply_debounced_noise_update(self) -> None:
         """Processa Ruído quando o usuário para de mover o slider."""
@@ -1660,6 +1779,8 @@ class MainWindow(QMainWindow):
             self.import_button, self.export_button, self.export_all_button,
             self.reset_button, self.compare_button, self.images_list,
             self.add_images_button, self.remove_image_button, self.clear_images_button,
+            self.preset_combo,
+            self.save_preset_button, self.update_preset_button, self.delete_preset_button,
             self.method_combo, self.colors_spinbox, self.pixel_scale_slider,
             self.threshold_slider, self.noise_slider, self.preserve_alpha_checkbox,
             self.hard_alpha_checkbox, self.remove_background_checkbox,
@@ -1688,12 +1809,14 @@ class MainWindow(QMainWindow):
         self.export_all_action.setEnabled(has_batch_items)
         self.reset_action.setEnabled(has_current_image)
         self.method_combo.setEnabled(True)
+        self.preset_combo.setEnabled(True)
         self.preserve_alpha_checkbox.setEnabled(True)
         self.hard_alpha_checkbox.setEnabled(True)
         self.remove_background_checkbox.setEnabled(True)
         self._update_background_controls()
         self._update_control_states()
         self._update_batch_list_state()
+        self._update_preset_buttons()
 
     def _start_export_worker(
         self,
@@ -1855,6 +1978,8 @@ class MainWindow(QMainWindow):
             self.import_button, self.export_button, self.reset_button,
             self.method_combo, self.colors_spinbox, self.threshold_slider,
             self.noise_slider, self.preserve_alpha_checkbox, self.hard_alpha_checkbox,
+            self.preset_combo,
+            self.save_preset_button, self.update_preset_button, self.delete_preset_button,
         )
         if is_exporting:
             for control in controls:
@@ -1868,6 +1993,7 @@ class MainWindow(QMainWindow):
         self.preserve_alpha_checkbox.setEnabled(True)
         self.hard_alpha_checkbox.setEnabled(True)
         self._update_control_states()
+        self._update_preset_buttons()
 
     def reset_application(self) -> None:
         """Limpa as imagens e restaura os controles aos valores iniciais."""
@@ -1920,6 +2046,8 @@ class MainWindow(QMainWindow):
         self._update_background_swatch()
         self._update_background_controls()
         del blockers
+        self.preset_combo.setCurrentIndex(0)
+        self.apply_processing_settings_to_ui(get_default_processing_settings())
         self._update_control_states()
         self._update_batch_list_state()
 
