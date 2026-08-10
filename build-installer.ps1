@@ -7,10 +7,10 @@ if (-not $iscc) { foreach ($path in @('C:\Program Files\Inno Setup 7\ISCC.exe','
 if (-not $iscc) { throw 'Inno Setup não foi encontrado. Instale o Inno Setup 6 ou 7 para gerar o instalador.' }
 python -m compileall app.py dither_app tests tools
 python -m unittest discover -s tests -v
-$installer = 'release\installer\DitherApp-Setup-0.10.0-beta-win64.exe'
+$installer = 'release\installer\DitherApp-Setup-0.11.0-beta-win64.exe'
 if (Test-Path $installer) { Remove-Item -Force $installer }
 & $iscc installer\DitherApp.iss
 if (-not (Test-Path $installer)) { throw 'O instalador não foi criado.' }
 $hash = Get-FileHash -Algorithm SHA256 $installer
-"Arquivo: DitherApp-Setup-0.10.0-beta-win64.exe`nAlgoritmo: SHA256`nHash: $($hash.Hash)" | Set-Content -Encoding UTF8 release\installer\SHA256.txt
+"Arquivo: DitherApp-Setup-0.11.0-beta-win64.exe`nAlgoritmo: SHA256`nHash: $($hash.Hash)" | Set-Content -Encoding UTF8 release\installer\SHA256.txt
 Write-Host "Instalador: $((Resolve-Path $installer).Path)"; Write-Host "SHA-256: $($hash.Hash)"

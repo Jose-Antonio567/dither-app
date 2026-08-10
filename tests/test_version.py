@@ -9,8 +9,8 @@ class VersionTests(unittest.TestCase):
     """Garante a versão entregue pela release atual."""
 
     def test_public_version(self) -> None:
-        self.assertEqual(APP_VERSION, "0.10.0")
-        self.assertEqual(APP_VERSION_LABEL, "0.10.0 Beta")
+        self.assertEqual(APP_VERSION, "0.11.0")
+        self.assertEqual(APP_VERSION_LABEL, "0.11.0 Beta")
 
 
 if __name__ == "__main__":
