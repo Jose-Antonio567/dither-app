@@ -1,11 +1,41 @@
-﻿.venv/
+# Generated files and local environments
+.venv/
+venv/
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Python packaging and Windows builds
 build/
 dist/
 release/
-release/installer/
 installer/Output/
+*.spec.bak
+*.manifest
+
+# Generated application icon (source artwork remains tracked)
 assets/app_icon.ico
-!DitherApp.spec
+
+# Local editor settings
 .vscode/
+.idea/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.local
+
+# Operating system files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Temporary files
+*.tmp
+*.tmp.*
